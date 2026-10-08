@@ -1,24 +1,61 @@
-# Research tools
+# Vision-Based Heuristic Decision Assistant
 
-These scripts are optional. `app.py` is the desktop application.
+A Python desktop application that combines **computer vision, heuristic optimization, and probabilistic modeling** to analyze visual board states and recommend strategic decisions.
 
-## Current tools
+Developed as an applied research project using a 5×5 game-based environment to explore visual recognition, mathematical search, decision optimization, and automated analysis.
 
-- `analyze_local_db.py` — summarize locally collected games, layouts and outcomes.
-- `analyze_history.py` — inspect bundled research count profiles.
-- `backtest.py` — replay recorded sequences through a policy profile.
-- `dashboard.py` — generate a local HTML research dashboard.
-- `evaluate_layout.py` — evaluate one board layout.
-- `export_dataset.py` — export local data for external analysis.
-- `offline_analyze.py` — analyze a saved screenshot offline.
-- `pretrain_solver.py` — distill synthetic solver-labelled states into the lightweight NumPy model.
-- `replay_game.py` — inspect a recorded game decision by decision.
-- `research_report.py` — compare known research layouts.
-- `search_lucky_layouts.py` — search candidate Lucky-line layouts.
-- `synthetic_benchmark.py` — benchmark policies on synthetic games.
-- `training_report.py` — inspect local policy-learning state.
-- `validate_release.py` — current offline release regressions/benchmark.
+## Key Features
 
-## Legacy-only
+- **Visual Recognition** — Screen capture, board detection, calibration, and state recognition.
+- **Heuristic Optimization** — Evaluate possible moves using constraints, priorities, and strategic objectives.
+- **Probabilistic Analysis** — Monte Carlo simulations and Expectimax-based decision planning.
+- **Decision Support** — Rank potential moves and present recommendations through a desktop interface.
+- **Experiment Tracking** — Store game states, decisions, and outcomes for analysis and replay.
+- **State Validation** — Confidence checks and consistency verification between observations and decisions.
 
-- `migrate_from_v3.py` — retained only to import old V3 research data. It is not part of normal V5.6.3 operation.
+## Tech Stack
+
+- **Language:** Python 3.11+
+- **Computer Vision:** OpenCV, NumPy, Pillow, MSS
+- **Desktop Interface:** Tkinter
+- **Database:** SQLite
+- **Environment:** Windows, Ubuntu/WSL
+- **Research Tools:** Docker (optional)
+
+## Core Concepts
+
+Computer Vision · Heuristic Search · Combinatorial Optimization · Monte Carlo Simulation · Expectimax · Probability · State Management · Applied Machine Learning
+
+The project primarily uses mathematical optimization and heuristic decision-making, with auxiliary learning experiments based on historical and synthetic data.
+
+## Getting Started
+
+**Requirements:** Windows, Python 3.11+, and WSL with Ubuntu.
+
+1. Clone or download the repository.
+2. Run `setup_windows.bat` to install dependencies and configure the environment.
+3. Launch the application using `run_windows.bat`.
+4. Complete **Auto Setup** to calibrate the visual board.
+5. Start monitoring and explore recommendations in **Live** mode.
+
+The solver operates through WSL. Docker is not required for normal use.
+
+## Project Structure
+
+- `vision_engine/` — Computer vision, decision logic, and optimization engine.
+- `tools/` — Research scripts, simulations, and evaluation utilities.
+- `tests/` — Automated tests and regression checks.
+- `data/` and `assets/` — Board configurations and visual reference data.
+- `docs/` — Additional technical documentation.
+
+## Architecture
+
+**Screen Capture → Visual Recognition → Mathematical Solver → Decision Ranking → Desktop Interface & SQLite**
+
+## Research & Development
+
+This project explores how visual perception, mathematical optimization, and probabilistic reasoning can support decisions in constrained environments.
+
+It is an experimental research application. Automated interaction features, including Auto Play, are not guaranteed to operate reliably in every environment.
+
+For more details, see [Architecture](ARCHITECTURE.md) and [Research](RESEARCH.md).
