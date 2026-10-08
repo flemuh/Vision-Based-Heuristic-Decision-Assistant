@@ -1,0 +1,16 @@
+[
+  {"name":"win1000","source":"real-chat","counts":[2,2,1,4,3,2]},
+  {"name":"red999","source":"real-chat","counts":[3,3,1,3,2,2]},
+  {"name":"green_fail","source":"real-chat","counts":[2,2,3,3,3,1]},
+  {"name":"blue894","source":"real-chat","counts":[3,1,2,3,2,3]},
+  {"name":"blue_alt","source":"real-chat","counts":[2,3,2,2,2,3]},
+  {"name":"random1","source":"real-chat","counts":[2,2,2,2,3,3]},
+  {"name":"random2_1026","source":"real-chat","counts":[2,2,2,3,2,3],"final_score":1026},
+  {"name":"random3","source":"real-chat","counts":[2,1,2,4,3,2]},
+  {"name":"random_bless_left","source":"real-chat","counts":[3,2,2,2,3,2]},
+  {"name":"new_A1","source":"real-chat","counts":[4,2,2,2,1,3]},
+  {"name":"new_A2","source":"real-chat","counts":[2,2,4,2,2,2]},
+  {"name":"new_A3","source":"real-chat","counts":[2,2,2,3,3,2]},
+  {"name":"new_B4","source":"real-chat","counts":[2,2,1,2,4,3]},
+  {"name":"new_C5","source":"real-chat","counts":[0,3,3,1,4,3]}
+]

@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest>=8.0
+pytesseract>=0.3.13  # legacy OCR tests/tools only; not used by live runtime

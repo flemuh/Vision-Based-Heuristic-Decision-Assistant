@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY vision_engine /app/vision_engine
+ENV PYTHONUNBUFFERED=1
+EXPOSE 57641
+CMD ["python", "-m", "vision_engine.solver.service", "--host", "0.0.0.0", "--port", "57641", "--workers", "6"]

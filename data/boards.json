@@ -1,0 +1,23 @@
+{
+  "base_original": [
+    ["CH", "HA", "SO", "CH", "HA"],
+    ["SO", "BL", "BL", "CR", "LI"],
+    ["BL", "CH", null, "CR", "HA"],
+    ["BL", "SO", "CH", "LI", "SO"],
+    ["LI", "CR", "CR", "LI", "HA"]
+  ],
+  "candidate_gt1000_balanced": [
+    ["LI", "HA", "SO", "CH", "HA"],
+    ["SO", "BL", "CR", "CR", "SO"],
+    ["BL", "CH", null, "CR", "HA"],
+    ["BL", "SO", "CH", "CH", "LI"],
+    ["LI", "CR", "BL", "LI", "HA"]
+  ],
+  "global_lucky_max_example": [
+    ["CH", "BL", "HA", "LI", "SO"],
+    ["SO", "CH", "BL", "CR", "HA"],
+    ["HA", "HA", null, "SO", "CR"],
+    ["CR", "LI", "CH", "BL", "LI"],
+    ["BL", "SO", "CR", "CH", "LI"]
+  ]
+}

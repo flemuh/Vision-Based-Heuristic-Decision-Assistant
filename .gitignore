@@ -1,0 +1,47 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime / personal game captures
+data/*.sqlite3
+data/*.sqlite3-*
+data/templates/*.png
+data/templates_archive/
+data/game_images/*
+data/decision_images/*
+data/backups/*
+data/exports/*
+data/*.joblib
+!data/templates/.gitkeep
+!data/game_images/.gitkeep
+!data/decision_images/.gitkeep
+!data/backups/.gitkeep
+!data/exports/.gitkeep
+
+# Local logs/config changes
+data/pip-install.log
+data/logs/
+data/panel_anchor.png
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# V5.2 separates learned board-cell and current-icon visual domains
+data/board_templates/*.png
+data/icon_templates/*.png
+!data/board_templates/.gitkeep
+!data/icon_templates/.gitkeep
+
+# Additional runtime artifacts
+*.log
+*.prof
+*.pstats
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+data/solver_tmp/
