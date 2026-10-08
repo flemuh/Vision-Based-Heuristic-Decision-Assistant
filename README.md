@@ -1,41 +1,24 @@
-# Vision-Based Heuristic Decision Assistant
+# Research tools
 
-A desktop research project that combines **computer vision, mathematical optimization, and probabilistic decision-making** to analyze a visual 5×5 board and recommend strategic moves. Built around a game-based case study.
+These scripts are optional. `app.py` is the desktop application.
 
-## Technologies
+## Current tools
 
-- **Python 3.11+**, OpenCV, NumPy, MSS, Pillow, Tkinter
-- **SQLite** for game history, decisions, and replay
-- **Ubuntu/WSL** for the persistent solver; Docker for optional offline benchmarks
+- `analyze_local_db.py` — summarize locally collected games, layouts and outcomes.
+- `analyze_history.py` — inspect bundled research count profiles.
+- `backtest.py` — replay recorded sequences through a policy profile.
+- `dashboard.py` — generate a local HTML research dashboard.
+- `evaluate_layout.py` — evaluate one board layout.
+- `export_dataset.py` — export local data for external analysis.
+- `offline_analyze.py` — analyze a saved screenshot offline.
+- `pretrain_solver.py` — distill synthetic solver-labelled states into the lightweight NumPy model.
+- `replay_game.py` — inspect a recorded game decision by decision.
+- `research_report.py` — compare known research layouts.
+- `search_lucky_layouts.py` — search candidate Lucky-line layouts.
+- `synthetic_benchmark.py` — benchmark policies on synthetic games.
+- `training_report.py` — inspect local policy-learning state.
+- `validate_release.py` — current offline release regressions/benchmark.
 
-## Core Concepts
+## Legacy-only
 
-- **Computer Vision:** screen capture, board calibration, feature matching, and state recognition
-- **Heuristic Search & Optimization:** route feasibility, constrained allocation, and move ranking
-- **Probabilistic Modeling:** Monte Carlo simulation and Expectimax planning
-- **State Consistency:** confidence checks, stale-result rejection, and transition validation
-- **Applied Machine Learning:** auxiliary local learning from historical decisions and retrospective outcomes
-
-## Run Locally (Windows)
-
-1. Install **Python 3.11+** and **WSL with Ubuntu**.
-2. Run `setup_windows.bat` to configure dependencies; follow any WSL setup prompts.
-3. Launch using `run_windows.bat`.
-4. In the application, complete **Auto Setup**, start monitoring, and inspect move recommendations in **Live**.
-
-The solver runs through WSL. Docker is **not required** for normal operation. Optional Auto Play is experimental and should not be treated as a guaranteed stable feature.
-
-## Repository structure
-
-- `vision_engine/` — internal Python package for vision and decision logic
-- `tools/` and `tests/` — research utilities and regression checks
-- `data/` and `assets/` — sample board configurations and vision bootstrap data
-- `docs/` — technical notes and experiment history
-
-The internal package was renamed to `vision_engine`; entry points and imports have been updated.
-
-## Architecture
-
-`Windows screen capture → visual state recognition → WSL mathematical solver → ranked recommendation → UI / SQLite history`
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the internal design and [RESEARCH.md](RESEARCH.md) for experiment details.
+- `migrate_from_v3.py` — retained only to import old V3 research data. It is not part of normal V5.6.3 operation.
