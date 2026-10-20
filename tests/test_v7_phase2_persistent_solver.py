@@ -1,5 +1,4 @@
 import threading
-import time
 
 from vision_engine import __version__
 from vision_engine.live.state import GameState

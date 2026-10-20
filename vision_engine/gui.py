@@ -14,7 +14,6 @@ from tkinter import messagebox, simpledialog, ttk
 import cv2
 
 from .advisor import Advisor, Recommendation, utility_learning_target
-from .autoplay import bounded_random_ms, paced_preclick_delay_ms, safe_cell_point, windows_input_preflight
 from .autocalibration import (
     detect_board_consensus,
     detect_board_grid,
@@ -51,13 +50,11 @@ from .recovery import reconcile_masks
 from .replay import format_replay_report, list_stored_games, stored_replay
 from .research_export import export_research_dataset
 from .data_home import prepare_user_data
-from .input_gate import MonitorInputGate
 from .diagnostics.resource_trend import sample_resources
 from .diagnostics.runtime_journal import RuntimeJournal
 from .diagnostics.win32_resources import collect_gui_resources, collect_process_vitals
 from .diagnostics.waiting import WaitingDiagnostics
 from .diagnostics.win32 import set_win32_sink
-from .input_coordinator import AutoPlayCommitCoordinator, InputActionToken, InputCommitPhase
 from .result_reader import VerifiedResult
 from .result_verification import computed_gt1000_verification
 from .round_lifecycle import CompletionDetector, NewRoundDetector
@@ -83,8 +80,6 @@ from .ui_semantics import move_visual_status, visual_status_style
 from .live.state import GameState as LiveGameState
 from .live.coordinator import LiveCoordinator
 from .live.solver_bridge import LiveSolverBridge
-from .live.input_exclusive import InputExclusiveCoordinator
-from .live.input_executor import LiveInputExecutor
 from .solver.protocol import SolverRequest
 from .versioning import APP_VERSION
 from .vision import (
@@ -222,6 +217,7 @@ class BingoApp(tk.Tk):
             wsl_distro=self.app_cfg.solver_wsl_distro,
             auto_start_wsl=(self.app_cfg.solver_backend == "wsl" and self.app_cfg.solver_autostart_wsl),
             session_id=self.session_id,
+            backend=self.app_cfg.solver_backend,
         )
 
         self.region: ScreenRegion | None = None
@@ -276,6 +272,10 @@ class BingoApp(tk.Tk):
         # Windows had a chance to draw the recommendation colors.
         self._ranked_grid_mask: int | None = None
         self._ranked_grid_recs: list[Recommendation] = []
+        # Amber preview is advisory only; final colored ranking is authoritative.
+        self._preview_grid_mask: int | None = None
+        self._preview_grid_pos: int | None = None
+        self._last_monitor_grid_signature: tuple | None = None
         # V18 live UX remembers the displayed plan so target changes can be
         # explained explicitly instead of silently changing a label.
         self._ui_last_plan_target: str | None = None
@@ -306,27 +306,8 @@ class BingoApp(tk.Tk):
         self.phase = GamePhase.NO_BOARD
         self.overlay = MoveOverlay(self)
 
-        # V18.0.10 opt-in Auto Play TEST state. The monitor/solver remains the
-        # source of truth; this layer only executes the already-finalized #1
-        # recommendation and then waits for vision to confirm the board change.
-        self.autoplay_enabled = False
-        self.autoplay_target_games = max(1, int(self.app_cfg.autoplay_default_games))
-        self.autoplay_completed_games = 0
-        self.autoplay_last_attempt_key: tuple | None = None
-        self.autoplay_pending_key: tuple | None = None
-        self.autoplay_pending_timing: dict[str, int] | None = None
-        self.autoplay_watchdog_job = None
-        self.autoplay_campaign_started_at: float | None = None
-        # V18.0.25: one coordinator owns every scheduled/committing click and
-        # generation-stamps callbacks so stale work cannot drive Windows input.
-        self.autoplay_commit = AutoPlayCommitCoordinator()
-        # Monitor handshake remains one layer of the input-exclusive barrier.
-        self.autoplay_input_gate = MonitorInputGate()
-        self.input_exclusive = InputExclusiveCoordinator(
-            self.solver_bridge, self.autoplay_input_gate,
-            remote_solver=(self.app_cfg.solver_backend != "local"),
-        )
-        self.input_executor = LiveInputExecutor()
+        # Public build: recommendation-only. The assistant never sends mouse or
+        # keyboard input to the game window; the player makes every move.
 
         # V18.0.26 diagnostic probe: all hot-path events stay in memory.
         # diagnose_waiting.bat connects over localhost and writes the bundle.
@@ -341,7 +322,6 @@ class BingoApp(tk.Tk):
             )
         self._diag_monitor_heartbeat = 0.0
         self._diag_last_transition = 0.0
-        self._diag_last_click = 0.0
         self._diag_last_confirm = 0.0
         self._diag_last_stable_reason = ""
         self._waiting_probe_marker = self.data_dir / "waiting_probe.json"
@@ -556,300 +536,349 @@ class BingoApp(tk.Tk):
         ttk.Button(outer, text="Close", command=win.destroy).pack(anchor="e", pady=(10, 0))
 
     def _build(self):
-        setup = ttk.LabelFrame(self, text="Quick setup", padding=6)
-        self.setup_frame = setup
-        setup.pack(fill="x", padx=8, pady=(6, 3))
-
-        quick = ttk.Frame(setup)
-        quick.pack(fill="x")
-        self.auto_setup_btn = ttk.Button(quick, text="AUTO SETUP", command=self.auto_setup)
-        self.auto_setup_btn.pack(side="left", padx=(2, 10), ipadx=10, ipady=4)
-        ttk.Label(
-            quick,
-            text="Recommended: leave Jewel Bingo visible. AUTO SETUP handles geometry and references; manual repair is only for rare recovery cases.",
-            wraplength=680,
-        ).pack(side="left", fill="x", expand=True)
-        ttk.Button(quick, text="Repair / recovery", command=self._open_repair_dialog).pack(side="right", padx=(8, 0))
-
-        progress_row = ttk.Frame(setup)
-        self.setup_progress_row = progress_row
-        progress_row.pack(fill="x", pady=(5, 0))
-        self.auto_progress_var = tk.DoubleVar(value=0.0)
-        self.auto_progress = ttk.Progressbar(progress_row, maximum=100.0, variable=self.auto_progress_var)
-        self.auto_progress.pack(side="left", fill="x", expand=True)
-        self.auto_progress_text = tk.StringVar(value="Idle")
-        ttk.Label(progress_row, textvariable=self.auto_progress_text, width=28).pack(side="left", padx=(8, 0))
-
-        self.auto_log_text = tk.Text(setup, height=3, wrap="word", state="disabled", font=("Consolas", 8))
-        self.auto_log_text.pack(fill="x", pady=(6, 0))
-        self.auto_log_text.configure(state="normal")
-        self.auto_log_text.insert("end", "AUTO SETUP log will appear here.\n")
-        self.auto_log_text.configure(state="disabled")
-
-        self.setup_var = tk.StringVar(value="Setup: checking...")
-        ttk.Label(setup, textvariable=self.setup_var, wraplength=940).pack(anchor="w", pady=(8, 0))
-        self.setup_feedback_var = tk.StringVar(value="AUTO SETUP detects the panel, 5x5 board and jewel references. Current-jewel location is automatic while playing; use Repair / recovery only if automatic recovery fails.")
-        self.setup_feedback_label = ttk.Label(
-            setup, textvariable=self.setup_feedback_var, wraplength=940,
-            font=("Segoe UI", 9, "bold"), foreground="#24527a"
+        """Compact game and ML tabs; technical logs remain available on disk."""
+        self.compact_game_ui = True
+        # Respect the persisted operation mode; never silently enable the solver.
+        if self.app_cfg.operation_mode not in {"observe", "recommend"}:
+            self.app_cfg.operation_mode = "recommend"
+        self.minsize(660, 530)
+        self.geometry("810x660")
+        # R3.1: Keep the two operating modes OUTSIDE the Game/ML notebook.
+        # They must remain visible in BOTH tabs, even on compact displays.
+        self.operation_var = tk.StringVar(value=self.app_cfg.operation_mode)
+        self.mode_status_var = tk.StringVar(value=(
+            "OBSERVABLE ativo: captura e histórico, sem solver"
+            if self.app_cfg.operation_mode == "observe"
+            else "PLAY ativo: solver 3/4 e recomendações"
+        ))
+        self.mode_toolbar = ttk.LabelFrame(self, text="MODO DE OPERAÇÃO — sempre visível", padding=(10, 5, 10, 6))
+        self.mode_toolbar.pack(fill="x", padx=9, pady=(7, 3))
+        mode_actions = ttk.Frame(self.mode_toolbar)
+        mode_actions.pack(fill="x")
+        self.observable_mode_button = ttk.Radiobutton(
+            mode_actions, text="OBSERVABLE (sem cálculo)", variable=self.operation_var,
+            value="observe", command=self._change_operation_mode,
         )
-        self.setup_feedback_label.pack(anchor="w", pady=(5, 0))
+        self.observable_mode_button.pack(side="left", padx=(0, 22))
+        self.play_mode_button = ttk.Radiobutton(
+            mode_actions, text="PLAY / JOGAR (solver 3/4)", variable=self.operation_var,
+            value="recommend", command=self._change_operation_mode,
+        )
+        self.play_mode_button.pack(side="left")
+        ttk.Label(self.mode_toolbar, textvariable=self.mode_status_var,
+                  wraplength=770).pack(anchor="w", pady=(4, 0))
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+        game = ttk.Frame(self.notebook)
+        self.notebook.add(game, text="Jogo")
+        self.learning_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.learning_tab, text="Aprendizado (ML)")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_main_tab_changed)
 
-        ctl = ttk.Frame(self, padding=(8, 4, 8, 8))
+        setup = ttk.Frame(game, padding=(10, 8, 10, 4))
+        self.setup_frame = setup
+        setup.pack(fill="x")
+        self.auto_setup_btn = ttk.Button(setup, text="AUTO SETUP", command=self.auto_setup)
+        self.auto_setup_btn.pack(side="left", ipadx=8, ipady=4)
+        ttk.Button(setup, text="Repair", command=self._open_repair_dialog).pack(side="right", padx=(6, 0))
+        self.setup_var = tk.StringVar(value="Setup: checking...")
+        ttk.Label(setup, textvariable=self.setup_var, wraplength=510).pack(side="left", fill="x", expand=True, padx=12)
+        self.setup_feedback_var = tk.StringVar(value="Keep Jewel Bingo visible; use AUTO SETUP first.")
+        # Feedback is still available for errors but no technical log is shown.
+        self.setup_feedback_label = ttk.Label(game, textvariable=self.setup_feedback_var,
+                                             wraplength=740, foreground="#24527a")
+        self.setup_feedback_label.pack(fill="x", padx=12)
+        self.setup_progress_row = ttk.Frame(game, padding=(10, 0, 10, 2))
+        self.setup_progress_row.pack(fill="x")
+        self.auto_progress_var = tk.DoubleVar(value=0.0)
+        self.auto_progress = ttk.Progressbar(self.setup_progress_row, maximum=100.0,
+                                              variable=self.auto_progress_var)
+        self.auto_progress.pack(side="left", fill="x", expand=True)
+        self.auto_progress_text = tk.StringVar(value="Ready")
+        ttk.Label(self.setup_progress_row, textvariable=self.auto_progress_text,
+                  width=27).pack(side="left", padx=(7, 0))
+
+        ctl = ttk.Frame(game, padding=(10, 7, 10, 5))
         self.controls_frame = ctl
         ctl.pack(fill="x")
         self.start_btn = ttk.Button(ctl, text="START", command=self.toggle)
-        self.start_btn.pack(side="left", padx=3)
-        ttk.Label(ctl, text="Box (optional):").pack(side="left", padx=(10, 4))
-        self.box_color_var = tk.StringVar(value="")
-        # MU Jewel Bingo has only the three box colors used in this experiment.
-        # Radio buttons avoid the native ttk dropdown popup entirely and make
-        # color changes a constant-time Tk callback.
-        for _label, _value in (("Green", "green"), ("Blue", "blue"), ("Red", "red")):
-            ttk.Radiobutton(
-                ctl, text=_label, variable=self.box_color_var, value=_value,
-                command=self._on_box_color_change,
-            ).pack(side="left", padx=1)
-        ttk.Button(ctl, text="Clear", width=5, command=self._clear_box_color).pack(side="left", padx=(2, 6))
-
-        modes = ttk.Frame(self, padding=(8, 0, 8, 6))
-        modes.pack(fill="x")
-        ttk.Label(modes, text="Operation:").pack(side="left")
-        self.operation_var = tk.StringVar(value=self.app_cfg.operation_mode)
-        op = ttk.Combobox(modes, textvariable=self.operation_var, values=("recommend", "observe"), width=12, state="readonly")
-        op.pack(side="left", padx=(4, 12))
-        op.bind("<<ComboboxSelected>>", lambda _e: self._change_operation_mode())
-        ttk.Label(modes, text="Strategy:").pack(side="left")
+        self.start_btn.pack(side="left", ipadx=12, ipady=4)
+        # R3.1: The operating-mode controls live in the global toolbar above
+        # the notebook, so they cannot disappear behind Game/ML tab switching.
         self.strategy_var = tk.StringVar(value="Win >1000 / Adaptive")
-        ttk.Label(modes, textvariable=self.strategy_var).pack(side="left", padx=(4, 12))
         self.target_var = tk.StringVar(value="Target: waiting")
-        ttk.Label(modes, textvariable=self.target_var).pack(side="left", padx=(4, 10))
         self.phase_var = tk.StringVar(value="Phase: no-board")
-        ttk.Label(modes, textvariable=self.phase_var).pack(side="left", padx=(10, 0))
+        ttk.Label(ctl, text="Box:").pack(side="left", padx=(12, 4))
+        self.box_color_var = tk.StringVar(value="")
+        for name, value in (("Green", "green"), ("Blue", "blue"), ("Red", "red")):
+            ttk.Radiobutton(ctl, text=name, variable=self.box_color_var, value=value,
+                            command=self._on_box_color_change).pack(side="left", padx=1)
+        ttk.Button(ctl, text="Clear", command=self._clear_box_color).pack(side="left", padx=3)
 
-        autoplay_row = ttk.Frame(self, padding=(8, 0, 8, 5))
-        autoplay_row.pack(fill="x")
-        ttk.Label(autoplay_row, text="Auto Play TEST:").pack(side="left")
-        ttk.Label(autoplay_row, text="games").pack(side="left", padx=(8, 3))
-        self.autoplay_games_var = tk.StringVar(value=str(self.app_cfg.autoplay_default_games))
-        self.autoplay_games_spin = tk.Spinbox(
-            autoplay_row, from_=1, to=700, width=5, textvariable=self.autoplay_games_var, justify="center"
-        )
-        self.autoplay_games_spin.pack(side="left", padx=(0, 6))
-        self.autoplay_btn = ttk.Button(autoplay_row, text="AUTO PLAY TEST", command=self._toggle_autoplay)
-        self.autoplay_btn.pack(side="left")
-        self.autoplay_status_var = tk.StringVar(value="Auto: OFF")
-        ttk.Label(autoplay_row, textvariable=self.autoplay_status_var, wraplength=620).pack(side="left", padx=(10, 0))
-
-        self.status = tk.StringVar(value="Starting...")
-        ttk.Label(self, textvariable=self.status, padding=8, wraplength=940).pack(fill="x")
-
-        main = ttk.Frame(self, padding=8)
+        main = ttk.Frame(game, padding=(10, 5, 10, 6))
         main.pack(fill="both", expand=True)
         left = ttk.Frame(main)
-        left.pack(side="left", fill="y")
-        right = ttk.Frame(main)
-        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        left.pack(side="left", anchor="n")
+        right = ttk.Frame(main, padding=(14, 0, 0, 0))
+        right.pack(side="left", fill="both", expand=True)
 
         self.cell_vars = []
         grid = ttk.Frame(left)
-        grid.pack()
+        grid.pack(anchor="n")
         for r in range(5):
-            row = []
+            cells = []
             for c in range(5):
                 i = r * 5 + c
                 v = tk.StringVar(value="MU" if i == CENTER else "??")
-                b = tk.Button(grid, textvariable=v, width=7, height=2, command=lambda idx=i: self.toggle_cell(idx))
+                b = tk.Button(grid, textvariable=v, width=6, height=2,
+                              command=lambda idx=i: self.toggle_cell(idx))
                 b.grid(row=r, column=c, padx=2, pady=2)
-                row.append((v, b))
-            self.cell_vars.append(row)
-
+                cells.append((v, b))
+            self.cell_vars.append(cells)
         self.board_meta = tk.StringVar(value="Board: not read")
-        ttk.Label(left, textvariable=self.board_meta, wraplength=320).pack(anchor="w", pady=(8, 0))
+        ttk.Label(left, textvariable=self.board_meta, wraplength=340).pack(
+            anchor="w", pady=(8, 0))
 
-        # V18: the main surface is intentionally understandable without knowing
-        # Monte Carlo/Expectimax terminology. Deep math stays in Analysis.
-        self.notebook = ttk.Notebook(right)
-        self.notebook.pack(fill="both", expand=True)
-        self.live_tab = ttk.Frame(self.notebook, padding=10)
-        self.analysis_tab = ttk.Frame(self.notebook, padding=8)
-        self.learning_tab = ttk.Frame(self.notebook, padding=10)
-        self.system_tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.live_tab, text="Live")
-        self.notebook.add(self.analysis_tab, text="Analysis")
-        self.notebook.add(self.learning_tab, text="Learning")
-        self.notebook.add(self.system_tab, text="System")
-
-        detection = ttk.LabelFrame(self.live_tab, text="Current game", padding=6)
-        detection.pack(fill="x")
         self.current_label = tk.StringVar(value="Current jewel: waiting")
-        ttk.Label(detection, textvariable=self.current_label, font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
-        self.turn_label = tk.StringVar(value="Placed: 0/14 | Waiting for stable screen state")
-        ttk.Label(detection, textvariable=self.turn_label).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(right, textvariable=self.current_label,
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        self.turn_label = tk.StringVar(value="Placed: 0/14")
+        ttk.Label(right, textvariable=self.turn_label).pack(anchor="w", pady=(4, 0))
         self.vision_label = tk.StringVar(value="Vision: waiting")
-        ttk.Label(detection, textvariable=self.vision_label).grid(row=2, column=0, sticky="w", pady=(2, 0))
-        detection.columnconfigure(0, weight=1)
-
+        ttk.Label(right, textvariable=self.vision_label).pack(anchor="w")
         self.target_change_var = tk.StringVar(value="")
-        self.target_change_label = ttk.Label(
-            self.live_tab, textvariable=self.target_change_var, anchor="center",
-            font=("Segoe UI", 10, "bold"), foreground="#8a5a00", wraplength=600,
-        )
-        self.target_change_label.pack(fill="x", pady=(8, 0))
+        self.target_change_label = ttk.Label(right, textvariable=self.target_change_var,
+                                             wraplength=390, foreground="#8a5a00")
+        self.target_change_label.pack(anchor="w", pady=(6, 0))
 
-        decision = ttk.LabelFrame(self.live_tab, text="Recommendation", padding=7)
-        decision.pack(fill="x", pady=(8, 0))
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=(8, 6))
         self.live_move_var = tk.StringVar(value="WAITING")
-        ttk.Label(decision, textvariable=self.live_move_var, font=("Segoe UI", 19, "bold"), foreground="#176b2c").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(right, textvariable=self.live_move_var, font=("Segoe UI", 19, "bold"),
+                  foreground="#176b2c").pack(anchor="w")
         self.live_target_var = tk.StringVar(value="Target: waiting")
+        ttk.Label(right, textvariable=self.live_target_var, wraplength=400,
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(6, 0))
         self.live_route_var = tk.StringVar(value="Route: waiting")
+        ttk.Label(right, textvariable=self.live_route_var, wraplength=400).pack(anchor="w")
         self.live_health_var = tk.StringVar(value="Plan: --")
         self.live_slack_var = tk.StringVar(value="Slack: --")
         self.live_confidence_var = tk.StringVar(value="Confidence: --")
         self.live_reason_var = tk.StringVar(value="")
-        ttk.Label(decision, textvariable=self.live_target_var, font=("Segoe UI", 11, "bold")).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(decision, textvariable=self.live_route_var).grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
-        ttk.Label(decision, textvariable=self.live_health_var).grid(row=3, column=0, sticky="w", pady=(5, 0))
-        ttk.Label(decision, textvariable=self.live_slack_var).grid(row=3, column=1, sticky="w", padx=(14, 0), pady=(5, 0))
-        ttk.Label(decision, textvariable=self.live_confidence_var).grid(row=3, column=2, columnspan=2, sticky="w", padx=(14, 0), pady=(5, 0))
-        ttk.Label(decision, textvariable=self.live_reason_var, wraplength=600).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
-
-        chances = ttk.LabelFrame(self.live_tab, text="Plan & win chance", padding=6)
-        chances.pack(fill="x", pady=(6, 0))
+        ttk.Label(right, textvariable=self.live_health_var, wraplength=400).pack(anchor="w", pady=(4, 0))
+        ttk.Label(right, textvariable=self.live_slack_var).pack(anchor="w")
+        ttk.Label(right, textvariable=self.live_confidence_var).pack(anchor="w")
+        ttk.Label(right, textvariable=self.live_reason_var, wraplength=400).pack(
+            anchor="w", pady=(4, 0))
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=7)
         self.live_gt1000_var = tk.StringVar(value="Win >1000: --")
         self.live_target_chance_var = tk.StringVar(value="Goal possible: --")
         self.live_route_chance_var = tk.StringVar(value="Route possible: --")
-        # Kept for backwards-compatible tests/automation; expected score now lives
-        # in Analysis because a larger average score is not necessarily a better
-        # move for the active target.
         self.live_p3_var = tk.StringVar(value="3 Lucky: --")
         self.live_expected_var = tk.StringVar(value="Expected pts: --")
-        ttk.Label(chances, textvariable=self.live_gt1000_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 16))
-        ttk.Label(chances, textvariable=self.live_target_chance_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 16))
-        ttk.Label(chances, textvariable=self.live_route_chance_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 16))
-        ttk.Label(chances, textvariable=self.live_p3_var, font=("Segoe UI", 10, "bold")).pack(side="left")
+        for value in (self.live_gt1000_var, self.live_target_chance_var,
+                      self.live_route_chance_var, self.live_p3_var):
+            ttk.Label(right, textvariable=value).pack(anchor="w")
 
-        ranking = ttk.LabelFrame(self.live_tab, text="Best options", padding=6)
-        ranking.pack(fill="x", expand=False, pady=(8, 0))
-        self.live_rank_tree = ttk.Treeview(
-            ranking, columns=("move", "status", "target", "route", "win", "three"), show="headings", height=4
+        self.status = tk.StringVar(value="Starting...")
+        ttk.Label(game, textvariable=self.status, wraplength=765,
+                  padding=(12, 4, 12, 10)).pack(fill="x")
+
+        self._build_learning_tab()
+
+    def _on_main_tab_changed(self, _event=None) -> None:
+        if self.notebook.select() == str(self.learning_tab):
+            self._refresh_learning_panel()
+
+    def _build_learning_tab(self) -> None:
+        """Simple user-facing ML dashboard; research diagnostics are opt-in."""
+        # A fixed-height notebook must remain usable on 660px and smaller screens.
+        # The entire learning page scrolls, so technical details can never be clipped.
+        self.learning_scroll = tk.Canvas(self.learning_tab, highlightthickness=0,
+                                         borderwidth=0)
+        learning_scrollbar = ttk.Scrollbar(self.learning_tab, orient="vertical",
+                                           command=self.learning_scroll.yview)
+        self.learning_scroll.configure(yscrollcommand=learning_scrollbar.set)
+        learning_scrollbar.pack(side="right", fill="y")
+        self.learning_scroll.pack(side="left", fill="both", expand=True)
+        content = ttk.Frame(self.learning_scroll, padding=(2, 0, 8, 12))
+        self.learning_scroll_window = self.learning_scroll.create_window(
+            (0, 0), window=content, anchor="nw",
         )
-        for col, label, width in (("move","Move",78),("status","Why",92),("target","Goal",76),("route","Route",76),("win","Win",68),("three","3 Lucky",68)):
-            self.live_rank_tree.heading(col, text=label)
-            self.live_rank_tree.column(col, width=width, anchor="center", stretch=True)
-        for tag, bg in (("green","#d8f5df"),("yellow","#fff6bf"),("orange","#ffe0bf"),("amber","#ffe0a3"),("purple","#eadcf7")):
-            self.live_rank_tree.tag_configure(tag, background=bg)
-        self.live_rank_tree.pack(fill="x", expand=False)
+        content.bind("<Configure>", lambda _event: self.learning_scroll.configure(
+            scrollregion=self.learning_scroll.bbox("all")))
+        self.learning_scroll.bind("<Configure>", lambda event: self.learning_scroll.itemconfigure(
+            self.learning_scroll_window, width=event.width))
+        # Wheel over the learning panel itself; scrollbar stays available everywhere.
+        self.learning_scroll.bind("<MouseWheel>",
+                                  lambda event: self.learning_scroll.yview_scroll(
+                                      -int(event.delta / 120), "units"))
+        self.learning_scroll.bind("<Button-4>",
+                                  lambda _event: self.learning_scroll.yview_scroll(-1, "units"))
+        self.learning_scroll.bind("<Button-5>",
+                                  lambda _event: self.learning_scroll.yview_scroll(1, "units"))
+        ttk.Label(content, text="Aprendizado das partidas",
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(
+            content,
+            text=("O solver matemático continua responsável pelas jogadas. "
+                  "O histórico só pode desempatar quando o tabuleiro e a sequência anterior "
+                  "forem idênticos aos de uma partida válida com 999 pontos ou mais."),
+            wraplength=745,
+        ).pack(anchor="w", pady=(3, 8))
 
-        self.live_color_legend_var = tk.StringVar(
-            value="Colors: GREEN Best/Equal  |  YELLOW Close  |  ORANGE Less flex  |  AMBER Forced slack  |  PURPLE Fallback  |  BLUE Already placed"
+        # Keep existing variable names for maintenance jobs and integrations.
+        self.learning_games_var = tk.StringVar(value="Carregando histórico...")
+        self.learning_wins_var = tk.StringVar(value="Carregando resultados...")
+        self.learning_audit_var = tk.StringVar(value="Carregando análises...")
+        self.learning_influence_var = tk.StringVar(value="Carregando decisões...")
+        self.learning_last_audit_var = tk.StringVar(value="Nenhuma partida analisada ainda.")
+        self.learning_status_var = tk.StringVar(value="Verificando se o ML influenciou decisões...")
+        self.learning_games_count_var = tk.StringVar(value="—")
+        self.learning_wins_count_var = tk.StringVar(value="—")
+        self.learning_opps_count_var = tk.StringVar(value="—")
+        self.learning_changes_count_var = tk.StringVar(value="—")
+
+        overview = ttk.Frame(content)
+        overview.pack(fill="x", pady=(0, 6))
+        for col in range(2):
+            overview.columnconfigure(col, weight=1, uniform="learning_summary")
+
+        def summary_card(row: int, col: int, title: str, value: tk.StringVar,
+                         subtitle: tk.StringVar) -> None:
+            frame = ttk.LabelFrame(overview, text=title, padding=(9, 5, 9, 8))
+            frame.grid(row=row, column=col, sticky="nsew", padx=3, pady=3)
+            ttk.Label(frame, textvariable=value,
+                      font=("Segoe UI", 17, "bold")).pack(anchor="w")
+            ttk.Label(frame, textvariable=subtitle,
+                      wraplength=315).pack(anchor="w", pady=(0, 1))
+
+        summary_card(0, 0, "Partidas registradas", self.learning_games_count_var,
+                     self.learning_games_var)
+        summary_card(0, 1, "Resultados 999+", self.learning_wins_count_var,
+                     self.learning_wins_var)
+        summary_card(1, 0, "Chances >1000 descobertas", self.learning_opps_count_var,
+                     self.learning_audit_var)
+        summary_card(1, 1, "Jogadas alteradas pelo ML", self.learning_changes_count_var,
+                     self.learning_influence_var)
+
+        situation = ttk.LabelFrame(content, text="O ML está ajudando?", padding=9)
+        situation.pack(fill="x", pady=(3, 6))
+        ttk.Label(situation, textvariable=self.learning_status_var,
+                  wraplength=720).pack(anchor="w")
+
+        latest_frame = ttk.LabelFrame(content, text="Última partida analisada", padding=9)
+        latest_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(latest_frame, textvariable=self.learning_last_audit_var,
+                  wraplength=720).pack(anchor="w")
+
+        self.learning_details_visible = False
+        self.learning_details_button = ttk.Button(
+            content, text="Mostrar detalhes técnicos ▼",
+            command=lambda: self._toggle_learning_details(),
         )
-        ttk.Label(
-            self.live_tab, textvariable=self.live_color_legend_var, wraplength=760,
-            font=("Segoe UI", 8), foreground="#444444"
-        ).pack(anchor="w", pady=(4, 0))
+        self.learning_details_button.pack(anchor="w", pady=(0, 4))
+        self.learning_details_frame = ttk.Frame(content)
+        # Intentionally NOT packed by default: no overwhelming technical page.
 
-        ttk.Label(self.analysis_tab, text="Detailed analysis", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        ttk.Label(
-            self.analysis_tab,
-            text="Exact route feasibility, Monte Carlo uncertainty, inventory needs and every candidate. This tab is optional during normal play.",
-            wraplength=680,
-        ).pack(anchor="w", pady=(2, 2))
-        ttk.Label(
-            self.analysis_tab,
-            text="Color guide: GREEN = best or exact equal; YELLOW = close; ORANGE = same goal with less flexibility; AMBER = forced slack; PURPLE = fallback; BLUE = already placed.",
-            wraplength=760, font=("Segoe UI", 9, "bold")
-        ).pack(anchor="w", pady=(0, 6))
-        analysis_body = ttk.Frame(self.analysis_tab)
-        analysis_body.pack(fill="both", expand=True)
-        self.rec_text = tk.Text(analysis_body, width=78, height=27, wrap="word", font=("Consolas", 9))
-        analysis_scroll = ttk.Scrollbar(analysis_body, orient="vertical", command=self.rec_text.yview)
-        self.rec_text.configure(yscrollcommand=analysis_scroll.set)
-        analysis_scroll.pack(side="right", fill="y")
-        self.rec_text.pack(side="left", fill="both", expand=True)
-        self.rec_text.tag_configure("title", font=("Consolas", 10, "bold"))
-        self.rec_text.tag_configure("best", font=("Consolas", 10, "bold"), foreground="#176b2c")
-        self.rec_text.tag_configure("tie", font=("Consolas", 9, "bold"), foreground="#8a5a00")
-        self.rec_text.tag_configure("green", foreground="#176b2c", font=("Consolas", 9, "bold"))
-        self.rec_text.tag_configure("yellow", foreground="#8a6d00", font=("Consolas", 9, "bold"))
-        self.rec_text.tag_configure("orange", foreground="#a54b00", font=("Consolas", 9, "bold"))
-        self.rec_text.tag_configure("amber", foreground="#9a6500", font=("Consolas", 9, "bold"))
-        self.rec_text.tag_configure("purple", foreground="#6b3fa0", font=("Consolas", 9, "bold"))
-        self.rec_text.tag_configure("muted", foreground="#555555")
-        self.rec_text.insert("end", "Detailed analysis will appear here after the first recommendation.")
-        self.rec_text.config(state="disabled")
+        self.learning_cf_var = tk.StringVar(value="Pesquisa de alternativas: --")
+        self.learning_outcome_var = tk.StringVar(value="Modelo de resultados: --")
+        self.learning_hindsight_var = tk.StringVar(value="Análise retrospectiva: --")
+        self.learning_pattern_var = tk.StringVar(value="Pesquisa de padrões: --")
+        self.learning_rng_var = tk.StringVar(value="Probabilidades de pedras: não ajustadas pelo ML")
 
-        ttk.Label(self.learning_tab, text="Learning status", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        technical = ttk.LabelFrame(self.learning_details_frame,
+                                   text="Treinamento e qualidade das previsões", padding=9)
+        technical.pack(fill="x", pady=(2, 6))
         ttk.Label(
-            self.learning_tab,
-            text="The math solver stays in control. Learning only helps with true ties. Completed games also provide retrospective candidate rewards; future jewels are never used as live inputs.",
-            wraplength=680,
-        ).pack(anchor="w", pady=(2, 8))
-        self.learning_games_var = tk.StringVar(value="Games: --")
-        self.learning_cf_var = tk.StringVar(value="Counterfactual model: --")
-        self.learning_outcome_var = tk.StringVar(value="Real-outcome model: --")
-        self.learning_hindsight_var = tk.StringVar(value="Hindsight reward model: --")
-        self.learning_pattern_var = tk.StringVar(value="Pattern research: --")
-        self.learning_rng_var = tk.StringVar(value="Solver RNG influence: DISABLED")
-        for var in (self.learning_games_var, self.learning_cf_var, self.learning_outcome_var, self.learning_hindsight_var, self.learning_pattern_var, self.learning_rng_var):
-            ttk.Label(self.learning_tab, textvariable=var, wraplength=680, font=("Segoe UI", 10)).pack(anchor="w", pady=2)
+            technical,
+            text=("MAE é o erro médio de previsão: quanto menor, melhor. "
+                  "Esses modelos são de pesquisa e NÃO demonstram ganho de pontuação no jogo."),
+            wraplength=690,
+        ).pack(anchor="w", pady=(0, 5))
+        for variable in (self.learning_cf_var, self.learning_outcome_var,
+                         self.learning_hindsight_var, self.learning_pattern_var, self.learning_rng_var):
+            ttk.Label(technical, textvariable=variable,
+                      wraplength=700).pack(anchor="w", pady=1)
+        self.learning_metrics_var = tk.StringVar(value="Aguardando métricas...")
+        ttk.Label(technical, textvariable=self.learning_metrics_var,
+                  wraplength=700).pack(anchor="w", pady=(6, 4))
+        ttk.Button(technical, text="Reprocessar aprendizado do histórico",
+                   command=self._rebuild_learning_history_async).pack(anchor="w", pady=(5, 0))
+        ttk.Label(technical, text="Reprocessar não apaga partidas. Pare o monitoramento antes de usar.",
+                  wraplength=690).pack(anchor="w", pady=(2, 0))
 
-        metrics = ttk.LabelFrame(self.learning_tab, text="Model quality", padding=8)
-        metrics.pack(fill="x", pady=(8, 0))
-        self.learning_metrics_var = tk.StringVar(value="Waiting for local data...")
-        ttk.Label(metrics, textvariable=self.learning_metrics_var, wraplength=680).pack(anchor="w")
-        ttk.Button(
-            metrics, text="Rebuild learning from stored games",
-            command=self._rebuild_learning_history_async,
-        ).pack(anchor="w", pady=(6, 0))
-
-        patterns = ttk.LabelFrame(self.learning_tab, text="Jewel frequency research", padding=8)
-        patterns.pack(fill="both", expand=True, pady=(8, 0))
-        self.learning_pattern_tree = ttk.Treeview(patterns, columns=("jewel","observed","expected","delta"), show="headings", height=6)
-        for col, label, width in (("jewel","Jewel",100),("observed","Observed",100),("expected","Expected",100),("delta","Difference",110)):
+        patterns = ttk.LabelFrame(self.learning_details_frame,
+                                  text="Frequência de pedras (pesquisa, sem alterar sorteios)", padding=8)
+        patterns.pack(fill="both", expand=True, pady=(1, 0))
+        self.learning_pattern_tree = ttk.Treeview(
+            patterns, columns=("jewel", "observed", "expected", "delta"),
+            show="headings", height=6,
+        )
+        for col, label, width in (("jewel", "Pedra", 95), ("observed", "Observado", 105),
+                                  ("expected", "Esperado", 105), ("delta", "Diferença", 110)):
             self.learning_pattern_tree.heading(col, text=label)
             self.learning_pattern_tree.column(col, width=width, anchor="center", stretch=True)
-        learning_tree_scroll = ttk.Scrollbar(patterns, orient="vertical", command=self.learning_pattern_tree.yview)
-        self.learning_pattern_tree.configure(yscrollcommand=learning_tree_scroll.set)
-        learning_tree_scroll.pack(side="right", fill="y")
+        scroll = ttk.Scrollbar(patterns, orient="vertical", command=self.learning_pattern_tree.yview)
+        self.learning_pattern_tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
         self.learning_pattern_tree.pack(side="left", fill="both", expand=True)
-        self._refresh_learning_panel()
 
-        ttk.Label(self.system_tab, text="System health", font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        ttk.Label(self.system_tab, text="Operational status and recovery tools. Normal play should not require this tab.", wraplength=680).pack(anchor="w", pady=(2, 8))
-        self.system_solver_var = tk.StringVar(value="Solver: checking...")
-        self.system_db_var = tk.StringVar(value="Database: checking...")
-        self.system_vision_var = tk.StringVar(value="Vision: waiting")
-        self.system_latency_var = tk.StringVar(value="Decision latency: no samples yet")
-        self.system_cache_var = tk.StringVar(value="Cache: no samples yet")
-        self.system_backup_var = tk.StringVar(value="Backups: checking...")
-        for var in (self.system_solver_var,self.system_db_var,self.system_vision_var,self.system_latency_var,self.system_cache_var,self.system_backup_var):
-            ttk.Label(self.system_tab, textvariable=var, wraplength=680).pack(anchor="w", pady=2)
-        actions = ttk.LabelFrame(self.system_tab, text="Tools", padding=8)
-        actions.pack(fill="x", pady=(10,0))
-        _system_actions = (
-            ("Refresh health", self._refresh_system_panel),
-            ("Recover current round", self._recover_current_round),
-            ("Game history / Replay", self._show_game_history),
-            ("Export research dataset", self._export_research_dataset),
-            ("Restart WSL solver", self._restart_solver_service),
-            ("Refresh logs", self._refresh_system_logs),
-        )
-        for _i, (_text, _cmd) in enumerate(_system_actions):
-            ttk.Button(actions, text=_text, command=_cmd).grid(row=_i // 3, column=_i % 3, sticky="ew", padx=3, pady=3)
-        for _c in range(3):
-            actions.columnconfigure(_c, weight=1)
+    def _toggle_learning_details(self) -> None:
+        """Expand/collapse optional ML diagnostics without rebuilding widgets."""
+        if self.learning_details_visible:
+            self.learning_details_frame.pack_forget()
+            self.learning_details_visible = False
+            self.learning_details_button.config(text="Mostrar detalhes técnicos ▼")
+        else:
+            self.learning_details_frame.pack(fill="both", expand=True, pady=(2, 5))
+            self.learning_details_visible = True
+            self.learning_details_button.config(text="Ocultar detalhes técnicos ▲")
 
-        logs = ttk.LabelFrame(self.system_tab, text="Recent technical log", padding=6)
-        logs.pack(fill="both", expand=True, pady=(8, 0))
-        self.system_log_text = tk.Text(logs, height=8, wrap="none", state="disabled", font=("Consolas", 8))
-        system_log_scroll = ttk.Scrollbar(logs, orient="vertical", command=self.system_log_text.yview)
-        self.system_log_text.configure(yscrollcommand=system_log_scroll.set)
-        system_log_scroll.pack(side="right", fill="y")
-        self.system_log_text.pack(side="left", fill="both", expand=True)
-        self._refresh_system_panel()
+    def _show_compact_decision(self, mask: int, jewel: str,
+                               recs: list[Recommendation], refined: bool) -> None:
+        """Update only the visible game information (never build analysis reports)."""
+        self.target_var.set(f"Target: {recs[0].active_goal if recs else 'waiting'}")
+        self._update_live_summary(mask, jewel, recs)
+        if not recs:
+            return
+        top = recs[0]
+        if not refined:
+            preview_row, preview_col = Board.rc(top.position)
+            self.live_move_var.set(f"PREVIEW: {jewel} → L{preview_row}C{preview_col}")
+            self.live_confidence_var.set("Confidence: PRELIMINARY")
+            self.live_reason_var.set("Preview may change. Wait for FINAL before moving.")
+        # Fast, idempotent telemetry: one final decision per game/step. Never
+        # perform retrospective search or retrain inside the monitor/solver path.
+        if refined and self.app_cfg.operation_mode == "recommend":
+            try:
+                self.db.record_ml_decision(
+                    self.episode_id, mask.bit_count(), jewel, top.ml_matched,
+                    top.ml_changed, top.ml_baseline_pos, top.position,
+                )
+            except Exception:
+                pass
+        rr, cc = Board.rc(top.position)
+        if not refined:
+            self.status.set(f"PREVIEW: {jewel} -> L{rr}C{cc}; refining final decision...")
+        elif top.tie_kind:
+            ties = "/".join(f"L{Board.rc(p)[0]}C{Board.rc(p)[1]}" for p in top.tied_with)
+            kind = "EXACT TIE" if top.tie_kind == "exact" else "CLOSE CALL"
+            self.status.set(f"{kind}: {jewel} L{rr}C{cc} / {ties} | target {top.active_goal}")
+        else:
+            stage = ("900+ SECURED" if top.method == "reward-tier-exact" and top.reward_guarantee == "900+ guaranteed"
+                     else "REWARD SECURED" if top.method == "reward-tier-exact" and top.reward_guarantee == ">1000 guaranteed"
+                     else "REWARD FIRST" if top.method == "reward-tier-exact"
+                     else "LUCKY IMMEDIATE" if top.method == "immediate-lucky-fastpath"
+                     else ("BEST" if refined else "PREVIEW — refining"))
+            self.status.set(f"{stage}: {jewel} -> L{rr}C{cc} | target {top.active_goal}")
+        if refined and self.app_cfg.overlay_enabled and self.region and self.vision_cfg.board_roi:
+            self.overlay.show_cell(self.region, self.vision_cfg.board_roi, rr, cc,
+                                   f"{jewel} -> {rr},{cc}")
+        else:
+            self.overlay.hide()
 
     def _refresh_learning_panel(self) -> None:
+        """Update readable summaries from the same existing database snapshot."""
         if not hasattr(self, "learning_games_var"):
             return
         try:
@@ -859,50 +888,126 @@ class BingoApp(tk.Tk):
                 rng_min_games=self.app_cfg.rng_min_games,
                 rng_blend=self.app_cfg.empirical_bias_blend,
             )
+            complete = snap['completed_games']
+            verified = snap['verified_games']
+            self.learning_games_count_var.set(str(complete))
             self.learning_games_var.set(
-                f"Games: {snap['completed_games']} completed | {snap['verified_games']} verified"
+                f"{verified} com placar verificado; os demais têm resultado registrado"
             )
+            memory = getattr(self.experience, "winning_memory", None)
+            wins = len(memory.examples) if memory is not None else 0
+            states = len(memory._by_state) if memory is not None else 0
+            self.learning_wins_count_var.set(str(wins))
+            self.learning_wins_var.set(
+                f"Histórico elegível; {states} estados de jogada indexados"
+            )
+            audit = snap['retrospective']
+            influence = snap['live_influence']
+            self.learning_opps_count_var.set(str(audit['recoverable_gt1000']))
+            self.learning_audit_var.set(
+                f"Entre {audit['analyzed']} partidas reconstruídas após o jogo; "
+                "não são vitórias reais"
+            )
+            self.learning_changes_count_var.set(str(influence['changes']))
+            self.learning_influence_var.set(
+                f"{influence['matches']} correspondências exatas em "
+                f"{influence['decisions']} decisões observadas"
+            )
+            if not influence['decisions']:
+                status = "Sem decisões acompanhadas ainda. Não é possível medir o efeito do ML."
+            elif influence['changes'] == 0:
+                status = (
+                    f"Até agora, o ML não alterou nenhuma das {influence['decisions']} "
+                    "decisões registradas. Não existe ganho de pontuação comprovado."
+                )
+            else:
+                status = (
+                    f"O ML alterou {influence['changes']} de {influence['decisions']} "
+                    "decisões registradas, apenas em desempates. Ainda NÃO foi medido "
+                    "se isso melhorou a pontuação em relação ao solver puro."
+                )
+            self.learning_status_var.set(status)
+
             self.learning_cf_var.set(
-                f"Counterfactual model: {snap['cf_status']} | {snap['cf_samples']} samples | "
-                f"validation {snap['cf_validation_games']}/{snap['required_validation_games']} games"
+                f"Counterfactual (pesquisa): {snap['cf_status']} | "
+                f"{snap['cf_samples']} amostras | "
+                f"validação {snap['cf_validation_games']}/{snap['required_validation_games']} partidas"
             )
             self.learning_outcome_var.set(
-                f"Real-outcome model: {snap['outcome_status']} | {snap['outcome_samples']} samples | "
-                f"validation {snap['outcome_validation_games']}/{snap['required_validation_games']} games"
+                f"Resultado real (sem influência): {snap['outcome_status']} | "
+                f"{snap['outcome_samples']} amostras | "
+                f"validação {snap['outcome_validation_games']}/{snap['required_validation_games']} partidas"
             )
             self.learning_hindsight_var.set(
-                f"Hindsight reward model: {snap['hindsight_status']} | {snap['hindsight_samples']} candidate rewards "
-                f"from {snap['hindsight_games']} games | validation {snap['hindsight_validation_games']}/{snap['required_validation_games']} games"
+                f"Hindsight (pesquisa): {snap['hindsight_status']} | "
+                f"{snap['hindsight_samples']} exemplos de {snap['hindsight_games']} partidas | "
+                f"validação {snap['hindsight_validation_games']}/{snap['required_validation_games']} partidas"
             )
             self.learning_pattern_var.set(
-                f"Pattern research: {snap['pattern_stage']} | {snap['pattern_games']} complete local games | "
-                f"{snap['repeated_layouts']} repeated layouts"
+                f"Padrões: {snap['pattern_stage']} | "
+                f"{snap['pattern_games']} partidas locais | "
+                f"{snap['repeated_layouts']} layouts repetidos"
             )
             self.learning_rng_var.set(
-                "Solver RNG influence: " + ("ENABLED" if snap['rng_influence_enabled'] else "DISABLED (research only)")
+                "Influência nas probabilidades de sorteio: " +
+                ("HABILITADA" if snap['rng_influence_enabled'] else "DESLIGADA (apenas pesquisa)")
             )
-            def fmt_pct(v):
-                return "--" if v is None else f"{v*100:.1f}%"
-            def fmt_num(v):
-                return "--" if v is None else f"{v:.1f}"
+            # Never carry the previous game's outcome into a fresh/empty DB.
+            last_text = "Nenhuma análise retrospectiva disponível ainda."
+            with self.db.connect() as con:
+                latest = con.execute("""SELECT ra.audit_json FROM retrospective_audits ra
+                    JOIN games g ON g.id=ra.game_id
+                    ORDER BY g.finished_at DESC LIMIT 1""").fetchone()
+            if latest:
+                value = json.loads(latest[0])
+                if value.get("valid"):
+                    observed = int(value['observed_total'])
+                    best = int(value['best_total'])
+                    lost = value.get("first_lost_gt1000")
+                    first = value.get("first_better_choice")
+                    choice = lost or first
+                    if choice and best > observed:
+                        positions = (choice.get('winning_alternative_positions') or
+                                     choice.get('better_alternative_positions') or [])[:3]
+                        where = ', '.join('L%dC%d' % Board.rc(p) for p in positions)
+                        hint = (f"Na jogada {choice['step']} ({choice['jewel']}), "
+                                f"avaliar {where}.") if where else "Houve outra rota possível."
+                    else:
+                        hint = "Não foi encontrada rota superior para as mesmas pedras."
+                    last_text = (
+                        f"Fez {observed} pontos. Melhor resultado calculado após a partida: "
+                        f"{best} pontos. {hint} O cálculo retrospectivo conhece as 14 "
+                        "pedras e não representa uma vitória real."
+                    )
+                else:
+                    last_text = "Última partida sem reconstrução consistente; não entrou na pesquisa."
+            self.learning_last_audit_var.set(last_text)
+
+            def fmt_pct(value):
+                return "—" if value is None else f"{value*100:.1f}%"
+            def fmt_num(value):
+                return "—" if value is None else f"{value:.1f}"
             improvement = snap['outcome_improvement']
-            imp = "--" if improvement is None else f"{improvement*100:.1f}% better than baseline"
+            imp = "—" if improvement is None else f"{improvement*100:.1f}% contra a referência"
             self.learning_metrics_var.set(
-                f"Counterfactual MAE: 3 Lucky {fmt_pct(snap['mae_p3'])} | >1000 {fmt_pct(snap['mae_gt1000'])} | "
-                f"score {fmt_num(snap['mae_score'])} pts\n"
-                f"Hindsight MAE: 3 Lucky {fmt_pct(snap['hindsight_mae_p3'])} | >1000 {fmt_pct(snap['hindsight_mae_gt1000'])} | "
-                f"best score {fmt_num(snap['hindsight_mae_score'])} pts\n"
-                f"Real-outcome residual MAE: {fmt_num(snap['outcome_residual_mae'])} | {imp}"
+                f"Counterfactual MAE: 3 Lucky {fmt_pct(snap['mae_p3'])} | "
+                f">1000 {fmt_pct(snap['mae_gt1000'])} | "
+                f"pontuação {fmt_num(snap['mae_score'])}\n"
+                f"Hindsight MAE: 3 Lucky {fmt_pct(snap['hindsight_mae_p3'])} | "
+                f">1000 {fmt_pct(snap['hindsight_mae_gt1000'])} | "
+                f"pontuação {fmt_num(snap['hindsight_mae_score'])}\n"
+                f"Resultado real MAE: {fmt_num(snap['outcome_residual_mae'])} | {imp}"
             )
             for iid in self.learning_pattern_tree.get_children():
                 self.learning_pattern_tree.delete(iid)
             for row in snap['jewel_rates']:
                 self.learning_pattern_tree.insert("", "end", values=(
-                    row['jewel'], f"{row['observed']*100:.1f}%", f"{row['expected']*100:.1f}%",
-                    f"{row['delta']*100:+.1f} pp",
+                    row['jewel'], f"{row['observed']*100:.1f}%",
+                    f"{row['expected']*100:.1f}%", f"{row['delta']*100:+.1f} pp",
                 ))
         except Exception as exc:
-            self.learning_games_var.set(f"Learning status unavailable: {exc}")
+            self.learning_status_var.set(f"Não foi possível carregar o aprendizado: {exc}")
+            self.learning_games_var.set("Verifique o banco de dados e tente novamente.")
 
     def _refresh_system_logs(self) -> None:
         if not hasattr(self, "system_log_text"):
@@ -1155,20 +1260,68 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             parent=self,
         )
 
+    def _show_observe_state(self) -> None:
+        """Read-only observation UI: do not ask the advisor or compute predictions."""
+        self.last_recs = []
+        self.cached_recommend_key = None
+        self._ranked_grid_mask = None
+        self._ranked_grid_recs = []
+        self._preview_grid_mask = None
+        self._preview_grid_pos = None
+        self.overlay.hide()
+        self._refresh_grid()
+        self.target_var.set("Target: disabled (Observable)")
+        self.target_change_var.set("")
+        if hasattr(self, "live_move_var"):
+            self.live_move_var.set("OBSERVABLE")
+            self.live_target_var.set("Sem recomendacao / no solver")
+            self.live_route_var.set("Lendo tabuleiro e registrando jogadas")
+            self.live_health_var.set("Somente observacao")
+            self.live_slack_var.set("")
+            self.live_confidence_var.set("")
+            self.live_reason_var.set("Mude para Jogar para calcular a melhor posição.")
+            self.live_gt1000_var.set("Win >1000: --")
+            self.live_target_chance_var.set("Goal possible: --")
+            self.live_route_chance_var.set("Route possible: --")
+            self.live_p3_var.set("3 Lucky: --")
+            self.live_expected_var.set("Expected pts: --")
+        self.status.set("OBSERVABLE: tabuleiro e jogadas registrados, sem cálculos do solver.")
+
     def _change_operation_mode(self):
-        self.app_cfg.operation_mode = self.operation_var.get().strip().lower() or "recommend"
+        new_mode = self.operation_var.get().strip().lower()
+        if new_mode not in {"observe", "recommend"}:
+            new_mode = "recommend"
+            self.operation_var.set(new_mode)
+        changed = self.app_cfg.operation_mode != new_mode
+        self.app_cfg.operation_mode = new_mode
         self.app_cfg.save(self.app_cfg_path)
-        if self.board is not None:
-            self.db.ensure_game(
-                self.episode_id, "local-auto", self.session_id, self.board, self.box_color,
-                self.app_cfg.operation_mode, self.app_cfg.risk_profile,
+        if hasattr(self, "mode_status_var"):
+            self.mode_status_var.set(
+                "OBSERVABLE ativo: captura e histórico, sem solver"
+                if new_mode == "observe"
+                else "PLAY ativo: solver 3/4 e recomendações"
             )
-        if self.app_cfg.operation_mode == "observe":
-            self.overlay.hide()
-            self.status.set("Observation mode: collecting the game without showing move advice.")
+        # Show the board immediately after changing modes; the selector itself
+        # stays visible and accessible above the Game/ML notebook.
+        if hasattr(self, "notebook"):
+            self.notebook.select(0)
+        # Generation barrier also discards stale WSL/process/fallback results.
+        self._invalidate_recommendation("operation changed to " + new_mode)
+        if new_mode == "observe":
+            # Queued WSL decisions must not start while in Observable.
+            self.solver_bridge._drop_pending_decisions()
+            self._show_observe_state()
         else:
-            self.status.set("Recommendation mode enabled.")
-            self._recommend()
+            self.status.set("JOGAR: solver e recomendações habilitados.")
+            if self.running and self.board is not None and self.current_jewel is not None:
+                self._recommend()
+        if changed and self.board is not None:
+            # Switching modes updates the episode's tracking metadata only;
+            # it never destroys its placements or the historical SQLite DB.
+            self.db.ensure_game(
+                self.episode_id, "local-auto", self.session_id, self.board,
+                self.box_color, self.app_cfg.operation_mode, self.app_cfg.risk_profile,
+            )
 
     def _change_strategy(self):
         """V7.0.5 live play has one automatic planner.
@@ -1356,8 +1509,6 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
                     "episode_id": self.episode_id,
                     "selected_count": int(self.selected_mask).bit_count(),
                     "current_jewel": self.current_jewel,
-                    "autoplay": bool(self.autoplay_enabled),
-                    "commit_phase": self.autoplay_commit.phase.value,
                     "monitor_age_ms": None if not self._diag_monitor_heartbeat else int((now - self._diag_monitor_heartbeat) * 1000),
                     "maintenance_active": bool(self.maintenance_thread and self.maintenance_thread.is_alive()),
                     "maintenance_pending_games": int(self._maintenance_pending_count),
@@ -2268,6 +2419,25 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
                 b.config(bg="#70a7ff" if selected else "SystemButtonFace", relief="raised", bd=1)
         if self._ranked_grid_mask == int(self.selected_mask) and self._ranked_grid_recs:
             self._paint_ranked_cells(int(self.selected_mask), self._ranked_grid_recs)
+        elif self._preview_grid_mask == int(self.selected_mask) and self._preview_grid_pos is not None:
+            pos = int(self._preview_grid_pos)
+            if pos != CENTER and not ((int(self.selected_mask) >> pos) & 1):
+                rr, cc = divmod(pos, 5)
+                _var, button = self.cell_vars[rr][cc]
+                button.config(bg="#ffe0a0", relief="solid", bd=3)
+
+    def _monitor_refresh_grid_if_changed(self) -> None:
+        """Avoid repainting 25 Tk cells on every identical camera frame.
+
+        Explicit recommendation and mode changes still repaint immediately.
+        """
+        if self.board is None:
+            return
+        signature = (self.episode_id, board_hash(self.board), int(self.selected_mask))
+        if signature == self._last_monitor_grid_signature:
+            return
+        self._last_monitor_grid_signature = signature
+        self._refresh_grid()
 
     def toggle_cell(self, idx: int):
         if idx == CENTER:
@@ -2279,8 +2449,14 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
 
     def _learned_scores(self, mask: int, jewel: str, positions: tuple[int, ...]) -> dict[int, float]:
         if self.board is None or not self.app_cfg.ml_enabled:
-            return {p: 0.0 for p in positions}
-        return self.experience.predict(self.board, mask, jewel, positions)
+            return {}
+        # Exact full-board + chronological jewel/position prefix only.
+        # No future jewels or scores are supplied by a live request.
+        return self.experience.predict(
+            self.board, mask, jewel, positions,
+            observed_jewels=tuple(self.game_sequence),
+            observed_positions=tuple(int(a["action_pos"]) for a in self.episode_actions),
+        )
 
     def _advisor(self) -> Advisor:
         assert self.board is not None
@@ -2365,7 +2541,7 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         )
 
     def _compute_recommendations(self, mask: int, jewel: str, persist: bool = True) -> list[Recommendation]:
-        if self.board is None:
+        if self.app_cfg.operation_mode != "recommend" or self.board is None:
             return []
         with self._solver_lock:
             key = (board_hash(self.board), int(mask), jewel)
@@ -2383,7 +2559,7 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         if ok:
             self._auto_log(f"V18 persistent solver ready: {status}", None, "INFO")
             if not self.running:
-                self.status.set("Persistent WSL solver ready. Live decisions will use cache/precompute.")
+                self.status.set("Persistent solver ready (" + self.app_cfg.solver_backend + ").")
         else:
             self._auto_log(f"V18 persistent solver unavailable: {status}; local fallback remains enabled", None, "WARN")
         self._refresh_system_panel()
@@ -2426,9 +2602,25 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         legacy = self._solver_request(mask, jewel, rollouts)
         return SolverRequest.from_legacy(request_id, state, legacy, purpose=purpose)
 
-    def _start_remote_solver(self, request_id: int, key: tuple, mask: int, jewel: str) -> None:
+    def _start_remote_solver(
+        self, request_id: int, key: tuple, mask: int, jewel: str, *, stage: str = "preview",
+    ) -> None:
+        """Two-step persistent solve: publish PREVIEW, then confirm FINAL.
+
+        Both requests run through the same single latest-state lane and hot
+        WSL worker. Only FINAL can commit an auto plan, persist ML or click.
+        """
+        if self.app_cfg.operation_mode != "recommend":
+            return
+        if request_id != self.recommend_request_id or self._recommend_state_key() != key:
+            return
+        # Progressive decisions give early visible feedback, then a final pass.
+        final = (stage == "final" or not self.app_cfg.progressive_live_decisions)
+        budget = self.app_cfg.live_rollouts if final else min(
+            int(self.app_cfg.preview_rollouts), int(self.app_cfg.live_rollouts)
+        )
         request = self._protocol_solver_request(
-            request_id, mask, jewel, self.app_cfg.live_rollouts, purpose="live-decision"
+            request_id, mask, jewel, budget, purpose="live-final" if final else "live-preview"
         )
         if request is None:
             return
@@ -2437,7 +2629,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
 
         def on_result(response):
             self._ui_call(
-                self._handle_remote_solver_result, request_id, key, mask, jewel, request, response, started
+                self._handle_remote_solver_result, request_id, key, mask, jewel, request,
+                response, started, "final" if final else "preview",
             )
 
         def on_error(exc):
@@ -2448,8 +2641,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         submit_info = self.solver_bridge.solve_async(request, on_result, on_error)
         self._runtime_record(
             "solver-decision-submit",
-            request_id=int(request_id),
-            jewel=str(jewel),
+            request_id=int(request_id), stage="final" if final else "preview",
+            rollouts=int(budget), jewel=str(jewel),
             selected_count=int(mask).bit_count(),
             accepted=bool(submit_info.get("accepted", False)),
             generation=int(submit_info.get("generation", 0)),
@@ -2458,7 +2651,7 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         if submit_info.get("superseded"):
             self._runtime_record(
                 "solver-decision-superseded", level="INFO",
-                newest_request_id=int(request_id), jewel=str(jewel),
+                newest_request_id=int(request_id), stage=stage, jewel=str(jewel),
                 selected_count=int(mask).bit_count(),
             )
 
@@ -2496,10 +2689,11 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             )
 
     def _handle_remote_solver_result(
-        self, request_id: int, key: tuple, mask: int, jewel: str, request: SolverRequest, response, started: float
+        self, request_id: int, key: tuple, mask: int, jewel: str,
+        request: SolverRequest, response, started: float, stage: str = "final",
     ) -> None:
-        if self.remote_solver_active_key == key:
-            self.remote_solver_active_key = None
+        if self.app_cfg.operation_mode != "recommend":
+            return
         coord = self.live_coordinator
         if (
             request_id != self.recommend_request_id
@@ -2512,28 +2706,45 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             self._auto_log("V18 discarded stale persistent-solver result", None, "INFO")
             return
         recs = list(response.recommendations)
+        exact = bool(recs and recs[0].method in {"immediate-lucky-fastpath", "reward-tier-exact"})
+        stage_ms = (time.perf_counter() - started) * 1000.0
+        overall_ms = ((time.perf_counter() - self._decision_started_at) * 1000.0
+                      if getattr(self, "_decision_started_key", None) == key else None)
+        self._runtime_record(
+            "solver-stage-result", request_id=int(request_id), stage=stage,
+            roundtrip_ms=round(stage_ms, 2), compute_ms=round(float(response.elapsed_ms), 2),
+            since_ui_request_ms=round(overall_ms, 2) if overall_ms is not None else None,
+            cache_hit=bool(response.cache_hit), state_mask=int(mask), jewel=str(jewel),
+        )
+        if stage == "preview" and not exact:
+            # Never cache, log a game decision, update the strategy or permit
+            # acting on this statistically provisional ranking.
+            self._render_recommendations(mask, jewel, recs, refined=False)
+            self._start_remote_solver(request_id, key, mask, jewel, stage="final")
+            return
+
+        if self.remote_solver_active_key == key:
+            self.remote_solver_active_key = None
         self.last_recs = recs
         self.cached_recommend_key = key
-        try:
-            self._persist_counterfactuals(mask, jewel, recs)
-        except Exception as exc:
-            self._auto_log(f"Could not persist V18 solver samples: {exc}", None, "WARN")
+        if not exact:
+            try:
+                self._persist_counterfactuals(mask, jewel, recs)
+            except Exception as exc:
+                self._auto_log(f"Could not persist V18 solver samples: {exc}", None, "WARN")
         self._adopt_auto_plan(recs)
         self._render_recommendations(mask, jewel, recs, refined=True)
-        # V18.0.26 restores speculative precompute between clicks. The global
-        # fence closes bridge+server admission and drains this work before input.
         self._schedule_speculative_best_child(mask, recs)
-        total_ms = (time.perf_counter() - started) * 1000.0
-        self._last_solver_roundtrip_ms = total_ms
+        self._last_solver_roundtrip_ms = stage_ms
         self._last_solver_compute_ms = float(response.elapsed_ms)
         try:
-            self.db.save_telemetry(self.episode_id, "decision-roundtrip", total_ms, response.cache_hit, {"jewel": jewel})
+            self.db.save_telemetry(self.episode_id, "decision-roundtrip", stage_ms, response.cache_hit, {"jewel": jewel})
             self.db.save_telemetry(self.episode_id, "solver-compute", response.elapsed_ms, response.cache_hit, {"jewel": jewel})
         except Exception:
             pass
         hot = "CACHE" if response.cache_hit else "COMPUTE"
         self._auto_log(
-            f"V18 {hot} decision {response.elapsed_ms:.1f} ms solver / {total_ms:.1f} ms round-trip",
+            f"V18 {hot} final {response.elapsed_ms:.1f} ms solver / {stage_ms:.1f} ms round-trip",
             None, "INFO",
         )
         self._refresh_system_panel()
@@ -2541,17 +2752,19 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
     def _handle_remote_solver_error(
         self, request_id: int, key: tuple, mask: int, jewel: str, exc: BaseException
     ) -> None:
+        if self.app_cfg.operation_mode != "recommend":
+            return
         if self.remote_solver_active_key == key:
             self.remote_solver_active_key = None
         if request_id != self.recommend_request_id or self._recommend_state_key() != key:
             return
         self._auto_log(
-            f"V18 persistent solver unavailable ({type(exc).__name__}: {exc}); using local compatibility fallback",
+            f"Native/persistent solver unavailable ({type(exc).__name__}: {exc}); using local compatibility fallback",
             None, "WARN",
         )
-        self.status.set("WSL solver unavailable; using bounded local fallback for this decision...")
-        # A WSL failure must not turn into the old 60 -> 1600 rollout live
-        # refinement. Publish one bounded FAST-quality answer and restart WSL
+        self.status.set("Persistent solver unavailable; using bounded local fallback...")
+        # A service failure must not turn into the old 60 -> 1600 rollout live
+        # refinement. Publish one bounded FAST-quality answer and restart service
         # in parallel; the next state will return to the persistent solver.
         self._start_solver_stage(request_id, key, mask, jewel, "fallback-final", self.app_cfg.fast_rollouts)
         self.solver_bridge.restart_async(lambda ok, status: self._ui_call(self._solver_service_status, ok, status))
@@ -2562,6 +2775,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         Disabled by default in the state-integrity root-fix because six CPU-bound
         speculative workers were measured consuming several cores during live UI.
         """
+        if self.app_cfg.operation_mode != "recommend":
+            return
         if not getattr(self.app_cfg, "live_speculative_precompute", False):
             return
         """Legacy description retained for research mode.
@@ -2595,6 +2810,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         self.solver_bridge.precompute_async(requests)
 
     def _schedule_precompute(self) -> None:
+        if self.app_cfg.operation_mode != "recommend":
+            return
         if not getattr(self.app_cfg, "live_speculative_precompute", False):
             return
         if self.app_cfg.solver_backend == "local" or self.board is None:
@@ -2637,6 +2854,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         )
 
     def _solver_request(self, mask: int, jewel: str, rollouts: int) -> dict:
+        if self.app_cfg.operation_mode != "recommend":
+            raise RuntimeError("Solver request is disabled in Observable mode")
         assert self.board is not None
         self._reload_experience_if_ready()
         hist = self.history.load()
@@ -2654,9 +2873,11 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             "jewel": jewel,
             "mode": self.app_cfg.mode,
             "exact_horizon": self.app_cfg.exact_horizon,
-            # Live latency budget: preserve the full exact endgame horizon, but
-            # avoid invoking a 3-ply exact solve inside every Monte-Carlo sample.
-            "rollout_exact_horizon": self.app_cfg.live_rollout_exact_horizon,
+            # Live latency budget: preserve full endgame Expectimax; allow
+            # rollout depths 3/4 only under bounded decision conditions.
+            "rollout_exact_horizon": self.app_cfg.live_horizon(
+                mask, len(positions), rollouts,
+            ),
             "rollouts": int(rollouts),
             "rng_seed": int(self.app_cfg.rng_seed),
             "bias_weights": list(weights),
@@ -2800,6 +3021,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             if auto_verified
             else "Verification: completed; automatic verification is reserved for >1000"
         )
+        if not hasattr(self, "rec_text"):
+            return
         self.rec_text.config(state="normal")
         self.rec_text.delete("1.0", "end")
         self.rec_text.insert(
@@ -2819,6 +3042,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         positions = self.board.legal_positions(jewel, mask)
         self._ranked_grid_mask = None
         self._ranked_grid_recs = []
+        self._preview_grid_mask = None
+        self._preview_grid_pos = None
         self._refresh_grid()
         for pos in positions:
             r0, c0 = divmod(pos, 5)
@@ -2831,6 +3056,10 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         strategy_name = {"auto": "Win >1000 / Adaptive", "adaptive": "Adaptive (legacy)", "score": "Score >1000 (legacy)", "lucky": "3 Lucky (legacy)"}.get(
             self.app_cfg.risk_profile, self.app_cfg.risk_profile
         )
+        if getattr(self, "compact_game_ui", False):
+            self.target_var.set("Target: calculating")
+            self.live_move_var.set(f"{jewel}  →  CALCULATING…")
+            return
         self.rec_text.config(state="normal")
         self.rec_text.delete("1.0", "end")
         self.rec_text.insert(
@@ -2850,6 +3079,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
     def _start_solver_stage(
         self, request_id: int, key: tuple, mask: int, jewel: str, stage: str, rollouts: int, attempt: int = 1
     ) -> None:
+        if self.app_cfg.operation_mode != "recommend":
+            return
         if request_id != self.recommend_request_id or self._recommend_state_key() != key:
             return
         if self.phase == GamePhase.COMPLETE or self.selected_mask.bit_count() >= 14:
@@ -2980,8 +3211,9 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         self.solver_fallback_thread.start()
 
     def _recommend(self):
-        """Latest-state-wins staged solver: neutral legal cells, FAST, then final refine."""
-        if self.autoplay_enabled and self.autoplay_commit.active:
+        """Latest-state-wins staged solver: never compute in Observable."""
+        if self.app_cfg.operation_mode != "recommend":
+            self._show_observe_state()
             return
         if self.board is None or self.current_jewel is None or self.selected_mask.bit_count() >= 14:
             return
@@ -3013,11 +3245,19 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         mask = int(self.selected_mask)
         jewel = str(self.current_jewel)
         self._render_legal_positions(mask, jewel)
-        self.status.set(f"ANALYZING: {jewel} — legal cells outlined; waiting for final decision.")
+        self._decision_started_at = time.perf_counter()
+        self._decision_started_key = key
+        self._runtime_record("solver-request-ui", request_id=int(request_id),
+                             selected_count=int(mask).bit_count(), jewel=jewel,
+                             backend=str(self.app_cfg.solver_backend))
+        self.status.set(f"ANALYZING: {jewel} — preview first, then confirmed final decision.")
         if self.app_cfg.solver_backend != "local":
             self._start_remote_solver(request_id, key, mask, jewel)
         else:
-            self._start_solver_stage(request_id, key, mask, jewel, "fast", self.app_cfg.fast_rollouts)
+            if self.app_cfg.progressive_live_decisions:
+                self._start_solver_stage(request_id, key, mask, jewel, "fast", min(self.app_cfg.preview_rollouts, self.app_cfg.live_rollouts))
+            else:
+                self._start_solver_stage(request_id, key, mask, jewel, "refine", self.app_cfg.live_rollouts)
 
     def _poll_solver(self, request_id: int, key: tuple, mask: int, jewel: str, stage: str) -> None:
         self.solver_poll_job = None
@@ -3056,6 +3296,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         self, request_id: int, key: tuple, mask: int, jewel: str, stage: str,
         kind: str, payload, elapsed: float, source: str,
     ) -> None:
+        if self.app_cfg.operation_mode != "recommend":
+            return
         if source == "thread-fallback" and self.solver_fallback_key == key:
             self.solver_fallback_key = None
             self.solver_fallback_stage = None
@@ -3078,14 +3320,16 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
 
         recs = list(payload)
         self._auto_log(f"SOLVER {stage} ready in {elapsed:.2f}s for {jewel} ({source})", None, "INFO")
+        self._runtime_record("solver-local-stage-result", stage=stage, backend=source,
+                             elapsed_ms=round(elapsed * 1000, 2), jewel=jewel)
 
         future_after_move = 14 - (mask.bit_count() + 1)
         exact_now = future_after_move <= self.app_cfg.exact_horizon
-        if stage == "fast" and not exact_now and self.app_cfg.rollouts > self.app_cfg.fast_rollouts:
-            # FAST is internal/provisional only. Never paint or expose a colored
-            # ranking that can visibly change a moment later.
-            self.status.set(f"FAST complete for {jewel}; refining final ranking...")
-            self.after(25, self._start_solver_stage, request_id, key, mask, jewel, "refine", self.app_cfg.rollouts)
+        immediate = bool(recs and recs[0].method in {"immediate-lucky-fastpath", "reward-tier-exact"})
+        if stage == "fast" and not immediate and not exact_now and self.app_cfg.progressive_live_decisions and self.app_cfg.live_rollouts > self.app_cfg.preview_rollouts:
+            # Present a clearly provisional recommendation.
+            self._render_recommendations(mask, jewel, recs, refined=False)
+            self.after(25, self._start_solver_stage, request_id, key, mask, jewel, "refine", self.app_cfg.live_rollouts)
             return
 
         # Only a final/exact decision becomes the authoritative recommendation
@@ -3093,10 +3337,11 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         # allowed to leak into recorded recommendations.
         self.last_recs = recs
         self.cached_recommend_key = key
-        try:
-            self._persist_counterfactuals(mask, jewel, recs)
-        except Exception as exc:
-            self._auto_log(f"Could not persist solver samples: {exc}", None, "WARN")
+        if not immediate:
+            try:
+                self._persist_counterfactuals(mask, jewel, recs)
+            except Exception as exc:
+                self._auto_log(f"Could not persist solver samples: {exc}", None, "WARN")
         self._adopt_auto_plan(recs)
         self._render_recommendations(mask, jewel, recs, refined=True)
 
@@ -3155,22 +3400,57 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         target = top.plan_target or top.active_goal or "best score"
         parts = [*(f"Lucky {x}" for x in top.plan_lucky_lines), *(f"Normal {x}" for x in top.plan_normal_lines)]
         route_name = " + ".join(parts) if parts else "best available score"
-        if target == "expected score":
+        if top.method == "reward-tier-exact":
+            if top.reward_guarantee == ">1000 guaranteed":
+                self.live_target_var.set("BOX >1000 GUARANTEED")
+            elif top.reward_guarantee == "900+ guaranteed":
+                self.live_target_var.set("BOX 900+ GUARANTEED")
+            else:
+                self.live_target_var.set(f"Best box chance: >=900 {top.reward_p_ge900*100:.1f}%")
+            self.live_route_var.set(
+                f"Worst case with the remaining draws: {top.reward_min_final} points"
+            )
+            self.live_health_var.set("Target health: SECURED" if top.reward_guarantee != "not guaranteed" else "Target health: AT RISK")
+        elif target == "expected score":
             self.live_target_var.set("Target: Best achievable score")
             self.live_route_var.set("Route: no structured route remains")
             self.live_health_var.set("Target health: SALVAGE")
         else:
-            self.live_target_var.set(f"Goal: {target}  ·  possible {top.target_probability*100:.1f}%")
-            self.live_route_var.set(f"Current route: {route_name}  ·  possible {top.plan_probability*100:.1f}%")
+            if target == ">=999" and top.plan_target == ">=999":
+                # Hypergeometric probability applies to this ONE concrete
+                # route's jewel requirements, not the chance of any >=999 win.
+                self.live_target_var.set("Goal: >=999  ·  proven-scoring geometry")
+                self.live_route_var.set(
+                    f"Current route: {route_name}  ·  stone availability {top.plan_probability*100:.1f}%"
+                )
+            else:
+                self.live_target_var.set(f"Goal: {target}  ·  possible {top.target_probability*100:.1f}%")
+                self.live_route_var.set(f"Current route: {route_name}  ·  possible {top.plan_probability*100:.1f}%")
             self.live_health_var.set(f"Target health: {self._plain_plan_health(top.target_probability)}")
-        if top.lucky_slack is not None and top.lucky_slack.viable:
+        if top.method == "reward-tier-exact":
+            self.live_slack_var.set("Reward tier priority: >1000 secured > 900+ secured > speculative score")
+        elif target == ">=999" and top.plan_target == ">=999":
+            self.live_slack_var.set(
+                f"999 route: {top.route_off_route} off-route / "
+                f"{top.route_slack_remaining} spare · floor {top.route_score_floor}"
+            )
+        elif top.lucky_slack is not None and top.lucky_slack.viable:
             self.live_slack_var.set(f"Slack: {top.lucky_slack.slack_remaining}/2")
         elif target == "3 Lucky":
             self.live_slack_var.set("Slack: none")
         else:
             self.live_slack_var.set("Slack: --")
         self.live_confidence_var.set(f"Confidence: {self._plain_confidence(top)}")
-        if top.route_switched:
+        if top.method == "reward-tier-exact":
+            reason = (
+                f"Guaranteed box: at least {top.reward_min_final} final points. "
+                "Avoid risking 900+ for only a chance of 999 (same reward category)."
+                if top.reward_guarantee != "not guaranteed"
+                else f"No box is guaranteed; maximum exact chance of >=900 is {top.reward_p_ge900*100:.1f}%."
+            )
+        elif top.method == "immediate-lucky-fastpath":
+            reason = "EXACT LUCKY: closes a line now without Monte Carlo; the active route was checked."
+        elif top.route_switched:
             reason = "ROUTE CHANGED: the previous route no longer survived this jewel; the target is still viable."
         elif top.forced_slack:
             reason = "FORCED SLACK: this jewel has no free cell in the locked route; best off-route move without sacrificing the target."
@@ -3185,18 +3465,36 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         else:
             reason = "Best move for the current automatic target."
         self.live_reason_var.set(reason)
-        self.live_gt1000_var.set(f"Win >1000: {top.utility.p_gt1000*100:.1f}%")
-        if target == "expected score":
+        if top.method == "immediate-lucky-fastpath" and top.utility.p_gt1000 < 1.0:
+            self.live_gt1000_var.set("Win >1000: -- (no simulation)")
+        else:
+            self.live_gt1000_var.set(f"Win >1000: {top.utility.p_gt1000*100:.1f}%")
+        if top.method == "reward-tier-exact":
+            self.live_target_chance_var.set(f"900+ reward: {min(100., top.reward_p_ge900*100):.1f}% exact")
+            self.live_route_chance_var.set(f"Minimum final score: {top.reward_min_final} (exact worst case)")
+        elif target == "expected score":
             self.live_target_chance_var.set("Goal possible: --")
             self.live_route_chance_var.set("Route possible: --")
+        elif target == ">=999" and top.plan_target == ">=999":
+            self.live_target_chance_var.set("Goal: >=999 / route verified by scoring rules")
+            self.live_route_chance_var.set(f"Route stones available: {top.plan_probability*100:.1f}%")
         else:
             self.live_target_chance_var.set(f"Goal possible: {top.target_probability*100:.1f}%")
             self.live_route_chance_var.set(f"Route possible: {top.plan_probability*100:.1f}%")
-        self.live_p3_var.set(f"3 Lucky: {top.utility.p3*100:.1f}%")
+        if top.method == "immediate-lucky-fastpath" and top.utility.p3 < 1.0:
+            self.live_p3_var.set("3 Lucky: -- (no simulation)")
+        else:
+            self.live_p3_var.set(f"3 Lucky: {top.utility.p3*100:.1f}%")
         self.live_expected_var.set(f"Expected pts: {top.utility.expected_score:.0f}")
 
         previous = self._ui_last_plan_target
-        if previous and previous != target:
+        if top.method == "reward-tier-exact":
+            self.target_change_var.set(
+                "REWARD FIRST: guarantee the available box; higher points in the same tier are not worth the gamble."
+                if top.reward_guarantee != "not guaranteed"
+                else "REWARD FIRST: exact endgame ranks the chance of reaching a reward box."
+            )
+        elif previous and previous != target:
             self.target_change_var.set(
                 f"TARGET CHANGED  {previous}  →  {target}   |   current jewel made the previous target too weak/impossible"
             )
@@ -3225,52 +3523,35 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
 
     def _render_recommendations(self, mask: int, jewel: str, recs: list[Recommendation], refined: bool = True) -> None:
         """Render a decision-first ranking with probabilities, ties and line impact."""
-        self.last_recs = list(recs)
+        # Keep the authoritative decision separate from provisional MC preview.
+        # _record_action() consumes last_recs: never feed them FAST.
+        if refined:
+            self.last_recs = list(recs)
         s = score_mask(mask)
 
         # OBSERVE is a strict no-advice mode. Do not leak recommendations through
         # board colors, ranking rows, probabilities or stale prior decisions.
         if self.app_cfg.operation_mode == "observe":
-            self._ranked_grid_mask = None
-            self._ranked_grid_recs = []
-            self.overlay.hide()
-            self._refresh_grid()
-            if hasattr(self, "live_move_var"):
-                self.live_move_var.set(f"{jewel} detected — OBSERVE")
-                self.live_target_var.set("Move advice hidden in Observe mode")
-                self.live_route_var.set("Switch Operation to recommend to receive a move.")
-                self.live_health_var.set("Observation only")
-                self.live_slack_var.set("")
-                self.live_confidence_var.set("")
-                self.live_reason_var.set("No ranking colors are shown in Observe mode.")
-                self.live_gt1000_var.set("Win >1000: --")
-                self.live_target_chance_var.set("Goal possible: --")
-                self.live_route_chance_var.set("Route possible: --")
-                self.live_p3_var.set("3 Lucky: --")
-                if hasattr(self, "live_rank_tree"):
-                    for iid in self.live_rank_tree.get_children():
-                        self.live_rank_tree.delete(iid)
-            self.rec_text.config(state="normal")
-            self.rec_text.delete("1.0", "end")
-            self.rec_text.insert(
-                "end",
-                "OBSERVATION MODE\n\n"
-                "Move advice is intentionally hidden. Board ranking colors are also disabled in this mode.\n"
-                "Switch Operation to 'recommend' when you want the assistant to choose a cell.\n\n"
-                f"Current: {s.lucky} Lucky, {s.normal} Normal, score-if-ended {s.total}\n"
-                f"Placed: {mask.bit_count()}/14 | board vision {self.board_confidence:.2f}"
-            )
-            self.rec_text.config(state="disabled")
-            self.status.set(f"OBSERVE: {jewel} detected; move advice and ranking colors hidden.")
+            self._show_observe_state()
             return
 
-        # Ranking colors are final-decision UI only. FAST remains internal and
-        # must never paint a recommendation that can visibly change moments later.
+        # Only final results paint ranked cells. Preliminary directions remain
+        # explicitly labelled PREVIEW and cannot commit an automatic click.
         if refined:
+            self._preview_grid_mask = None
+            self._preview_grid_pos = None
             self._ranked_grid_mask = int(mask)
             self._ranked_grid_recs = list(recs)
-            self._refresh_grid()
+        elif recs:
+            self._preview_grid_mask = int(mask)
+            self._preview_grid_pos = int(recs[0].position)
+        self._refresh_grid()
+        if refined:
             self.update_idletasks()
+
+        if getattr(self, "compact_game_ui", False):
+            self._show_compact_decision(mask, jewel, recs, refined)
+            return
 
         strategy_name = {"auto": "Win >1000 / Adaptive", "adaptive": "Adaptive (legacy)", "score": "Score >1000 (legacy)", "lucky": "3 Lucky (legacy)"}.get(
             self.app_cfg.risk_profile, self.app_cfg.risk_profile
@@ -3375,7 +3656,7 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             if top.routes:
                 put("STRUCTURAL ROUTES (exact remaining-inventory feasibility)\n", "title")
                 shown_targets = (
-                    "3 Lucky + 1 Normal", "3 Lucky", "2 Lucky + 2 Normal",
+                    ">=999", "3 Lucky + 1 Normal", "3 Lucky", "2 Lucky + 2 Normal",
                     "2 Lucky + 1 Normal", "1 Lucky + 2 Normal", "1 Lucky + 1 Normal",
                 )
                 for target_name in shown_targets:
@@ -3439,19 +3720,18 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         if recs:
             top = recs[0]
             rr, cc = Board.rc(top.position)
-            if top.tie_kind:
+            if not refined:
+                self.status.set(f"PREVIEW: {jewel} -> L{rr}C{cc}; refining final decision...")
+            elif top.tie_kind:
                 ties = "/".join(f"L{Board.rc(p)[0]}C{Board.rc(p)[1]}" for p in top.tied_with)
                 prefix = "EXACT TIE" if top.tie_kind == "exact" else ("STAT TIE" if top.tie_kind == "statistical" else "TARGET TIE")
                 self.status.set(f"{prefix}: {jewel} L{rr}C{cc} / {ties} | target {top.active_goal}")
-            elif refined:
-                self.status.set(f"BEST: {jewel} -> L{rr}C{cc} | target {top.active_goal}")
             else:
-                self.status.set(f"FAST PROVISIONAL: {jewel} -> L{rr}C{cc}; refinement is still running")
-            if self.app_cfg.overlay_enabled and self.region and self.vision_cfg.board_roi:
+                self.status.set(f"BEST: {jewel} -> L{rr}C{cc} | target {top.active_goal}")
+            if refined and self.app_cfg.overlay_enabled and self.region and self.vision_cfg.board_roi:
                 self.overlay.show_cell(self.region, self.vision_cfg.board_roi, rr, cc, f"{jewel} -> {rr},{cc}")
             else:
                 self.overlay.hide()
-            self._maybe_schedule_autoplay(mask, jewel, recs, refined=refined)
 
     def _persist_box_color_async(self):
         if self.board is None:
@@ -3509,103 +3789,6 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             self.current_label.set(f"Current jewel corrected: {label} / {JEWEL_NAMES[label]}")
             self._recommend()
 
-    def _autoplay_disable(self, reason: str) -> None:
-        self.waiting_diagnostics.record(
-            "autoplay-disabled", reason=str(reason), phase=self.autoplay_commit.phase.value,
-            mask=int(self.selected_mask), session_id=self.session_id,
-        )
-        self.autoplay_input_gate.force_release()
-        self.autoplay_commit.invalidate()
-        self.autoplay_enabled = False
-        self.autoplay_campaign_started_at = None
-        self.autoplay_pending_key = None
-        self.autoplay_pending_timing = None
-        if self.autoplay_watchdog_job is not None:
-            try:
-                self.after_cancel(self.autoplay_watchdog_job)
-            except Exception:
-                pass
-            self.autoplay_watchdog_job = None
-        # V18.0.26 uses a per-click global solver fence. No async solver-control
-        # command is submitted while an exclusive transaction may be closing.
-        if hasattr(self, "autoplay_btn"):
-            self.autoplay_btn.config(text="AUTO PLAY TEST")
-        if hasattr(self, "autoplay_status_var"):
-            self.autoplay_status_var.set(f"Auto: OFF | {reason}")
-        self._auto_log(f"AUTO PLAY TEST stopped: {reason}", None, "INFO")
-
-    def _toggle_autoplay(self) -> None:
-        if self.autoplay_enabled:
-            self._autoplay_disable("stopped by user")
-            return
-        if not self.running:
-            messagebox.showinfo("Auto Play TEST", "Press START first so live vision is running.", parent=self)
-            return
-        if self.app_cfg.operation_mode != "recommend":
-            messagebox.showinfo("Auto Play TEST", "Operation must be 'recommend'.", parent=self)
-            return
-        if self.region is None or self.vision_cfg.board_roi is None:
-            messagebox.showinfo("Auto Play TEST", "AUTO SETUP must be complete first.", parent=self)
-            return
-        input_ok, input_backend = windows_input_preflight()
-        if not input_ok:
-            messagebox.showerror(
-                "Auto Play TEST - mouse control blocked",
-                "The board and solver are ready, but Windows did not allow cursor control.\n\n"
-                f"Diagnostic: {input_backend}\n\n"
-                "This is unrelated to the optional Green/Blue/Red box label. "
-                "Run the Assistant at the same Windows privilege level as MU (if MU is Administrator, "
-                "start run_windows.bat as Administrator too), then try AUTO PLAY TEST again.",
-                parent=self,
-            )
-            self.autoplay_status_var.set(f"Auto: OFF | mouse preflight failed: {input_backend}")
-            return
-        try:
-            target = max(1, min(700, int(self.autoplay_games_var.get())))
-        except Exception:
-            target = 1
-            self.autoplay_games_var.set("1")
-        self.autoplay_target_games = target
-        self.autoplay_completed_games = 0
-        self.autoplay_last_attempt_key = None
-        self.autoplay_pending_key = None
-        self.autoplay_pending_timing = None
-        self.autoplay_commit.invalidate()
-        self.autoplay_enabled = True
-        sample_resources("autoplay-armed", games=int(self.autoplay_completed_games))
-        self.waiting_diagnostics.record(
-            "autoplay-armed", session_id=self.session_id, episode_id=self.episode_id,
-            target_games=target, mask=int(self.selected_mask),
-        )
-        # V18.0.26 closes foreground+background admissions atomically only at
-        # commit time; ordinary solver work remains available between clicks.
-        slot_s = max(1.0, float(self.app_cfg.autoplay_target_game_seconds)) / 14.0
-        self.autoplay_campaign_started_at = time.monotonic() - int(self.selected_mask).bit_count() * slot_s
-        self.autoplay_btn.config(text="STOP AUTO")
-        self.autoplay_status_var.set(
-            f"Auto: ARMED 0/{target} | input-exclusive | pace ~{self.app_cfg.autoplay_target_game_seconds:.1f}s/game"
-        )
-        self._auto_log(
-            f"AUTO PLAY TEST armed for {target} game(s); global solver fence enabled; "
-            f"clicks require bridge-idle + solver-idle + monitor-safe-point; pacing target "
-            f"~{self.app_cfg.autoplay_target_game_seconds:.1f}s/game.",
-            None, "INFO"
-        )
-        if self.last_recs and self.current_jewel:
-            self._maybe_schedule_autoplay(
-                int(self.selected_mask), str(self.current_jewel), list(self.last_recs), refined=True
-            )
-
-    def _autoplay_target_overlaps_assistant(self, x: int, y: int) -> bool:
-        try:
-            left = int(self.winfo_rootx())
-            top = int(self.winfo_rooty())
-            right = left + int(self.winfo_width())
-            bottom = top + int(self.winfo_height())
-            return left <= x < right and top <= y < bottom
-        except Exception:
-            return False
-
     def _waiting_diagnostic_snapshot(self) -> dict:
         now = time.monotonic()
         with self._live_state_lock:
@@ -3621,7 +3804,6 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
                 "completion_pending": bool(self.completion_pending),
                 "episode_finalized": bool(self.episode_finalized),
             }
-        token = self.autoplay_commit.token
         bridge = self.solver_bridge.admission.snapshot()
         return {
             **live,
@@ -3631,20 +3813,8 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             "monitor_heartbeat": float(self._diag_monitor_heartbeat),
             "monitor_heartbeat_age_ms": None if not self._diag_monitor_heartbeat else int((now - self._diag_monitor_heartbeat) * 1000),
             "last_transition_age_ms": None if not self._diag_last_transition else int((now - self._diag_last_transition) * 1000),
-            "last_click_age_ms": None if not self._diag_last_click else int((now - self._diag_last_click) * 1000),
             "last_confirm_age_ms": None if not self._diag_last_confirm else int((now - self._diag_last_confirm) * 1000),
             "last_stable_reason": self._diag_last_stable_reason,
-            "autoplay_enabled": bool(self.autoplay_enabled),
-            "commit_phase": self.autoplay_commit.phase.value,
-            "commit_generation": int(self.autoplay_commit.generation),
-            "commit_token": None if token is None else {
-                "episode_id": token.episode_id, "generation": token.generation,
-                "mask": token.mask, "jewel": token.jewel, "position": token.position,
-            },
-            "autoplay_pending": self.autoplay_pending_key is not None,
-            "watchdog_armed": self.autoplay_watchdog_job is not None,
-            "monitor_requested": self.autoplay_input_gate.requested,
-            "monitor_quiesced": self.autoplay_input_gate.quiesced,
             "bridge_admission": bridge,
             "solver_bridge_available": bool(self.solver_bridge.available),
             "solver_bridge_status": str(self.solver_bridge.status),
@@ -3655,348 +3825,13 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             "solver_wsl_distro": str(self.app_cfg.solver_wsl_distro),
         }
 
-    def _autoplay_live_snapshot(self) -> dict:
-        with self._live_state_lock:
-            return {
-                "episode_id": self.episode_id,
-                "board": self.board,
-                "mask": int(self.selected_mask),
-                "jewel": self.current_jewel,
-                "current_confidence": float(self.current_confidence),
-                "current_margin": float(self.current_margin),
-                "current_entropy": float(self.current_entropy),
-                "board_confidence": float(self.board_confidence),
-                "warning": self.last_state_warning,
-                "episode_finalized": bool(self.episode_finalized),
-                "completion_pending": bool(self.completion_pending),
-            }
-
-    def _maybe_schedule_autoplay(
-        self, mask: int, jewel: str, recs: list[Recommendation], refined: bool
-    ) -> None:
-        if not self.autoplay_enabled or not refined or not recs:
-            return
-        if not self.running or self.app_cfg.operation_mode != "recommend":
-            return
-        snap = self._autoplay_live_snapshot()
-        if snap["episode_finalized"] or snap["completion_pending"] or mask.bit_count() >= 14:
-            return
-        if self.region is None or self.vision_cfg.board_roi is None:
-            self._autoplay_disable("screen geometry is unavailable")
-            return
-        if snap["board"] is None or snap["jewel"] != jewel or snap["mask"] != int(mask):
-            return
-        if snap["warning"]:
-            self._autoplay_disable("state warning requires manual review")
-            return
-        if (
-            snap["current_confidence"] < self.vision_cfg.current_min_confidence
-            or snap["current_margin"] < self.vision_cfg.current_min_margin
-            or snap["current_entropy"] > self.vision_cfg.current_max_entropy
-            or snap["board_confidence"] < self.vision_cfg.board_min_confidence
-        ):
-            return
-
-        top = recs[0]
-        raw_key = (snap["episode_id"], int(mask), str(jewel), int(top.position))
-        pending = self.autoplay_pending_key
-        if raw_key == self.autoplay_last_attempt_key:
-            return
-        if isinstance(pending, InputActionToken) and pending.legacy_key == raw_key:
-            return
-        token = self.autoplay_commit.reserve(*raw_key)
-        if token is None:
-            return
-        self.autoplay_pending_key = token
-        base_delay_ms = bounded_random_ms(
-            self.app_cfg.autoplay_click_delay_min_ms,
-            self.app_cfg.autoplay_click_delay_max_ms,
-        )
-        extra_settle_ms = bounded_random_ms(
-            self.app_cfg.autoplay_extra_settle_min_ms,
-            self.app_cfg.autoplay_extra_settle_max_ms,
-        )
-        safety_delay_ms = base_delay_ms + extra_settle_ms
-        if self.autoplay_campaign_started_at is None:
-            slot_s = max(1.0, float(self.app_cfg.autoplay_target_game_seconds)) / 14.0
-            self.autoplay_campaign_started_at = time.monotonic() - int(mask).bit_count() * slot_s
-        delay_ms = paced_preclick_delay_ms(
-            campaign_started_at=float(self.autoplay_campaign_started_at),
-            now=time.monotonic(),
-            completed_games=int(self.autoplay_completed_games),
-            placed_count=int(mask).bit_count(),
-            target_game_seconds=float(self.app_cfg.autoplay_target_game_seconds),
-            expected_transition_ms=int(self.app_cfg.autoplay_expected_transition_ms),
-            safety_delay_ms=int(safety_delay_ms),
-            max_pacing_wait_ms=int(self.app_cfg.autoplay_max_pacing_wait_ms),
-        )
-        self.waiting_diagnostics.record(
-            "click-scheduled", episode_id=token.episode_id, generation=token.generation,
-            mask=token.mask, jewel=token.jewel, position=token.position, delay_ms=int(delay_ms),
-        )
-        self.autoplay_pending_timing = {
-            "base_delay_ms": int(base_delay_ms),
-            "extra_settle_ms": int(extra_settle_ms),
-            "safety_delay_ms": int(safety_delay_ms),
-            "pacing_extra_ms": int(max(0, delay_ms - safety_delay_ms)),
-            "total_preclick_ms": int(delay_ms),
-        }
-        self.autoplay_status_var.set(
-            f"Auto: READY {self.autoplay_completed_games}/{self.autoplay_target_games} | "
-            f"{jewel} -> L{Board.rc(top.position)[0]}C{Board.rc(top.position)[1]} | "
-            f"gen {token.generation} | wait {delay_ms}ms"
-        )
-        self.after(delay_ms, lambda t=token: self._execute_autoplay_click(t))
-
-    def _autoplay_state_still_valid(self, token: InputActionToken) -> bool:
-        if not self.autoplay_commit.is_current(token):
-            return False
-        snap = self._autoplay_live_snapshot()
-        state_key = self._recommend_state_key()
-        return bool(
-            self.running
-            and self.app_cfg.operation_mode == "recommend"
-            and snap["episode_id"] == token.episode_id
-            and snap["mask"] == int(token.mask)
-            and snap["jewel"] == token.jewel
-            and self.last_recs
-            and int(self.last_recs[0].position) == int(token.position)
-            and self.cached_recommend_key == state_key
-            and not snap["warning"]
-            and not snap["episode_finalized"]
-            and not snap["completion_pending"]
-            and int(token.mask).bit_count() < 14
-            and self.region is not None
-            and self.vision_cfg.board_roi is not None
-            and snap["current_confidence"] >= self.vision_cfg.current_min_confidence
-            and snap["current_margin"] >= self.vision_cfg.current_min_margin
-            and snap["current_entropy"] <= self.vision_cfg.current_max_entropy
-            and snap["board_confidence"] >= self.vision_cfg.board_min_confidence
-        )
-
-    def _execute_autoplay_click(self, token: InputActionToken) -> None:
-        self.waiting_diagnostics.record(
-            "click-execute-enter", generation=token.generation, mask=token.mask,
-            jewel=token.jewel, position=token.position,
-        )
-        if not self.autoplay_enabled or self.autoplay_pending_key != token:
-            return
-        if not self.autoplay_commit.begin_prepare(token):
-            return
-        if not self._autoplay_state_still_valid(token):
-            self.autoplay_pending_key = None
-            self.autoplay_pending_timing = None
-            self.autoplay_commit.abort(token)
-            if self.autoplay_enabled:
-                self.autoplay_status_var.set("Auto: WAITING | stale state before input preparation")
-            return
-
-        lease = None
-        barrier: dict = {}
-        try:
-            lease = self.input_exclusive.acquire(solver_timeout=5.0, monitor_timeout=2.0)
-            barrier = lease.info
-            self.waiting_diagnostics.record(
-                "exclusive-acquired", generation=token.generation,
-                bridge_active=int(barrier.get("bridge_active", -1)),
-                foreground=int(barrier.get("foreground", -1)),
-                background=int(barrier.get("background", -1)),
-                monitor_quiesced=bool(lease.monitor_quiesced),
-            )
-            if not self.autoplay_commit.begin_quiesce(token):
-                return
-            if not self._autoplay_state_still_valid(token):
-                self.autoplay_pending_key = None
-                self.autoplay_pending_timing = None
-                self.autoplay_commit.abort(token)
-                self.autoplay_status_var.set("Auto: WAITING | state changed before input commit")
-                return
-            if not self.autoplay_commit.begin_commit(token):
-                return
-
-            point = safe_cell_point(
-                self.region, self.vision_cfg.board_roi, int(token.position),
-                jitter_fraction=self.app_cfg.autoplay_click_jitter_fraction,
-            )
-            if self._autoplay_target_overlaps_assistant(point.x, point.y):
-                self._autoplay_disable("target cell is covered by the assistant window")
-                return
-
-            move_ms = bounded_random_ms(
-                self.app_cfg.autoplay_move_duration_min_ms,
-                self.app_cfg.autoplay_move_duration_max_ms,
-            )
-            timing = dict(self.autoplay_pending_timing or {})
-            self.autoplay_last_attempt_key = token.legacy_key
-
-            # At this point: Windows bridge IPC=0, WSL foreground=0, WSL
-            # background=0, server admissions closed, monitor parked. The state
-            # lock protects the commit decision only; it is deliberately released
-            # before the 220-380 ms physical cursor path (and possible retries).
-            with self._live_state_lock:
-                if (
-                    self.episode_id != token.episode_id
-                    or int(self.selected_mask) != int(token.mask)
-                    or self.current_jewel != token.jewel
-                ):
-                    raise RuntimeError("live state changed during input commit")
-            input_backend = self.input_executor.move_and_left_click(
-                lease, point, duration_ms=move_ms
-            )
-
-            if not self.autoplay_commit.mark_clicked(token):
-                raise RuntimeError("Auto Play commit ownership was lost before click confirmation")
-            self._diag_last_click = time.monotonic()
-            self.waiting_diagnostics.record(
-                "click-complete", generation=token.generation, mask=token.mask,
-                jewel=token.jewel, position=token.position, backend=str(input_backend),
-            )
-            self.autoplay_pending_key = None
-            self.autoplay_pending_timing = None
-
-            rr, cc = Board.rc(int(token.position))
-            self.autoplay_status_var.set(
-                f"Auto: CLICKED {token.jewel} -> L{rr}C{cc} via {input_backend}; waiting for board confirmation"
-            )
-            self.db.log_event(
-                self.episode_id, "autoplay-click",
-                f"Auto Play TEST clicked {token.jewel} -> L{rr}C{cc}", self.phase.value,
-                {
-                    "generation": int(token.generation),
-                    "position": int(token.position), "x": point.x, "y": point.y,
-                    "move_ms": move_ms, "mask_before": int(token.mask),
-                    "base_delay_ms": int(timing.get("base_delay_ms", 0)),
-                    "extra_settle_ms": int(timing.get("extra_settle_ms", 0)),
-                    "safety_delay_ms": int(timing.get("safety_delay_ms", 0)),
-                    "pacing_extra_ms": int(timing.get("pacing_extra_ms", 0)),
-                    "total_preclick_ms": int(timing.get("total_preclick_ms", 0)),
-                    "target_game_seconds": float(self.app_cfg.autoplay_target_game_seconds),
-                    "input_backend": str(input_backend),
-                    "trajectory": "v11-linear-smoothstep",
-                    "monitor_quiesced": True,
-                    "solver_global_idle": True,
-                    "solver_foreground": int(barrier.get("foreground", 0)),
-                    "solver_background": int(barrier.get("background", 0)),
-                    "bridge_active_ipc": int(barrier.get("bridge_active", 0)),
-                    "session_id": self.session_id,
-                },
-            )
-        except Exception as exc:
-            self.waiting_diagnostics.record(
-                "click-error", generation=token.generation, error=f"{type(exc).__name__}: {exc}"
-            )
-            self.autoplay_commit.abort(token)
-            self._autoplay_disable(f"click error: {exc}")
-            return
-        finally:
-            if lease is not None:
-                try:
-                    lease.release()
-                    self.waiting_diagnostics.record("exclusive-released", generation=token.generation)
-                except Exception as release_exc:
-                    self.waiting_diagnostics.record(
-                        "exclusive-release-error", generation=token.generation,
-                        error=f"{type(release_exc).__name__}: {release_exc}",
-                    )
-                    self._auto_log(
-                        f"GLOBAL FENCE release failed: {type(release_exc).__name__}: {release_exc}",
-                        None, "ERROR",
-                    )
-
-        if self.autoplay_watchdog_job is not None:
-            try:
-                self.after_cancel(self.autoplay_watchdog_job)
-            except Exception:
-                pass
-        watchdog_ms = max(1000, int(self.app_cfg.autoplay_transition_timeout_ms))
-        self.autoplay_watchdog_job = self.after(
-            watchdog_ms, lambda t=token: self._autoplay_transition_watchdog(t),
-        )
-        self.waiting_diagnostics.record(
-            "transition-watchdog-armed", generation=token.generation, timeout_ms=watchdog_ms
-        )
-
-    def _autoplay_transition_watchdog(self, token: InputActionToken) -> None:
-        self.autoplay_watchdog_job = None
-        self.waiting_diagnostics.record(
-            "transition-watchdog-fired", generation=token.generation, mask=token.mask
-        )
-        if not self.autoplay_enabled or not self.autoplay_commit.is_current(token):
-            return
-        snap = self._autoplay_live_snapshot()
-        if snap["episode_id"] == token.episode_id and snap["mask"] == int(token.mask):
-            self._autoplay_disable("no board transition confirmed after click")
-
-    def _autoplay_board_advanced(self, old_mask: int, new_mask: int) -> None:
-        self._diag_last_transition = time.monotonic()
-        sample_resources(
-            "board-advanced", games=int(self.autoplay_completed_games),
-            placed=int(new_mask).bit_count(),
-        )
-        self.waiting_diagnostics.record(
-            "board-advanced", old_mask=int(old_mask), new_mask=int(new_mask),
-            old_count=int(old_mask).bit_count(), new_count=int(new_mask).bit_count(),
-        )
-        if not self.autoplay_enabled:
-            return
-        if self.autoplay_watchdog_job is not None:
-            try:
-                self.after_cancel(self.autoplay_watchdog_job)
-            except Exception:
-                pass
-            self.autoplay_watchdog_job = None
-        self.autoplay_pending_key = None
-        self.autoplay_pending_timing = None
-        token = self.autoplay_commit.token
-        confirmed = bool(
-            token is not None
-            and self.autoplay_commit.phase is InputCommitPhase.AWAIT_CONFIRM
-            and token.episode_id == self.episode_id
-            and int(token.mask) == int(old_mask)
-        )
-        if confirmed:
-            self.autoplay_commit.confirm(token)
-            self._diag_last_confirm = time.monotonic()
-            self.waiting_diagnostics.record(
-                "click-confirmed", generation=token.generation, new_mask=int(new_mask)
-            )
-        else:
-            # An unsolicited board transition invalidates every queued callback.
-            self.autoplay_commit.invalidate()
-        self.autoplay_status_var.set(
-            f"Auto: CONFIRMED {new_mask.bit_count()}/14 | "
-            f"games {self.autoplay_completed_games}/{self.autoplay_target_games}"
-        )
-        # V18.0.26 allows precompute between commits; the next commit acquires
-        # the global fence and drains it before any Windows input begins.
-
-    def _autoplay_game_completed(self) -> None:
-        if not self.autoplay_enabled:
-            return
-        self.autoplay_completed_games += 1
-        if self.autoplay_completed_games >= self.autoplay_target_games:
-            self._autoplay_disable(f"target reached: {self.autoplay_completed_games} game(s)")
-        else:
-            self.autoplay_status_var.set(
-                f"Auto: WAIT NEXT ROUND {self.autoplay_completed_games}/{self.autoplay_target_games}"
-            )
-
     def _set_live_compact_mode(self, active: bool) -> None:
-        """Free vertical space while monitoring without hiding recovery access."""
+        """Keep setup progress out of the way while monitoring the game."""
         try:
             if active:
-                if self.auto_log_text.winfo_manager():
-                    self.auto_log_text.pack_forget()
-                if self.setup_progress_row.winfo_manager():
-                    self.setup_progress_row.pack_forget()
-                self.setup_feedback_label.pack_forget()
-            else:
-                if not self.setup_progress_row.winfo_manager():
-                    self.setup_progress_row.pack(fill="x", pady=(5, 0), after=self.auto_setup_btn.master)
-                if not self.auto_log_text.winfo_manager():
-                    self.auto_log_text.pack(fill="x", pady=(5, 0), after=self.setup_progress_row)
-                if not self.setup_feedback_label.winfo_manager():
-                    self.setup_feedback_label.pack(anchor="w", pady=(4, 0))
+                self.setup_progress_row.pack_forget()
+            elif not self.setup_progress_row.winfo_manager():
+                self.setup_progress_row.pack(fill="x", before=self.controls_frame)
         except tk.TclError:
             pass
 
@@ -4044,8 +3879,6 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             )
             self.status.set("START active — validating the live board across multiple frames. Keep Jewel Bingo visible for a moment.")
         else:
-            if self.autoplay_enabled:
-                self._autoplay_disable("monitoring stopped")
             self.running = False
             self._runtime_record(
                 "monitor-stop", episode_id=self.episode_id, selected_count=int(self.selected_mask).bit_count(),
@@ -4130,12 +3963,15 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
                 self.phase.value,
                 {"predicted": predicted_jewel, "actual": actual_jewel, "position": pos},
             )
-            try:
-                recs = self._compute_recommendations(mask_before, actual_jewel, True)
-            except Exception:
+            if self.app_cfg.operation_mode == "recommend":
+                try:
+                    recs = self._compute_recommendations(mask_before, actual_jewel, True)
+                except Exception:
+                    recs = []
+            else:
                 recs = []
         else:
-            recs = list(self.last_recs)
+            recs = list(self.last_recs) if self.app_cfg.operation_mode == "recommend" else []
 
         chosen_rec = next((r for r in recs if r.position == pos), None)
         recommended_pos = recs[0].position if recs else None
@@ -4234,6 +4070,29 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             target=work, name="history-learning-rebuild", daemon=True
         )
         self.maintenance_thread.start()
+
+    def _audit_finished_episode_async(self, game_id: str) -> None:
+        """Idempotent offline replay on a separate worker, after finalization."""
+        def work():
+            try:
+                from .winning_memory import validated_episodes
+                from .retrospective_learning import cached_audit
+                local_db = BingoDB(self.data_dir / "bingo.sqlite3")
+                episode = next((e for e in validated_episodes(local_db) if e.game_id == game_id), None)
+                if episode is None:
+                    local_db.log_event(game_id, "hindsight-rejected", "incomplete or inconsistent history")
+                    return
+                report = cached_audit(local_db, episode)
+                if not report or not report.get("valid"):
+                    return
+                local_db.log_event(game_id, "hindsight-audited", "complete offline replay",
+                                   payload={"actual": report["observed_total"],
+                                            "possible_best": report["best_total"],
+                                            "source": "counterfactual-not-real-win"})
+                self._ui_call(self._refresh_learning_panel)
+            except Exception as exc:
+                self._runtime_record("hindsight-audit-error", level="WARN", error=str(exc), episode_id=game_id)
+        threading.Thread(target=work, name="finished-game-hindsight", daemon=True).start()
 
     def _post_game_maintenance_async(self, completed_episode_id: str, *, already_queued: bool = False) -> None:
         """Train/backup without competing with live vision/input.
@@ -4360,7 +4219,6 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             self._maintenance_reload_pending = False
 
     def _start_detected_round(self, board: Board, mask: int, confidence: float) -> None:
-        self.autoplay_commit.invalidate()
         previous_episode = self.episode_id
         if self.completion_pending and not self.episode_finalized:
             self.db.finalize_partial_game(
@@ -4525,6 +4383,9 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             )
             self._ui_call(self._refresh_learning_panel)
         completed_episode_id = self.episode_id
+        # Analyze the just-finished game without waiting for a full-history ML
+        # rebuild; a separate low-priority thread never blocks screen capture.
+        self._audit_finished_episode_async(completed_episode_id)
         self._post_game_maintenance_async(completed_episode_id)
         self.new_round_detector.reset()
         self.completion_detector.reset()
@@ -4536,15 +4397,11 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         else:
             self._set_status(
                 f"Game saved ✅ {s.lucky} Lucky, {s.normal} Normal, {s.total}. "
-                "Watching automatically for the next round. Automatic verification is reserved for trusted >1000 completions."
+                "Watching for the next round. Offline hindsight will check alternatives after monitoring stops."
             )
 
     def _loop(self):
         while self.running:
-            # Explicit safe point between complete vision cycles. If Auto Play
-            # requests exclusive input, acknowledge here and park until the
-            # cursor move + click is complete.
-            self.autoplay_input_gate.monitor_safe_point(running=self.running)
             self._diag_monitor_heartbeat = time.monotonic()
             if not self.running:
                 break
@@ -4846,7 +4703,6 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
                     with self._live_state_lock:
                         self.selected_mask = int(new_mask)
                 if transitioned:
-                    self._ui_call(self._autoplay_board_advanced, int(old_mask), int(new_mask))
                     self._update_phase()
                     self._checkpoint_state(
                         "mask-rollback" if stable.reason.startswith("rollback-false-plus-one") else "mask-commit",
@@ -4876,7 +4732,6 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
                     self._ui_call(self._invalidate_recommendation, "game complete", None)
                     self._ui_call(self._show_game_complete_summary, s_final.lucky, s_final.normal, s_final.total)
                     self._finalize_episode(panel)
-                    self._ui_call(self._autoplay_game_completed)
                     self._ui_call(self.current_label.set, "Current jewel: game complete")
                     continue
 
@@ -4920,7 +4775,7 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
                         )
 
                 self._update_phase()
-                self._ui_call(self._refresh_grid)
+                self._ui_call(self._monitor_refresh_grid_if_changed)
                 if self.current_jewel:
                     self._ui_call(
                         self.current_label.set,
@@ -4936,7 +4791,7 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
                     episode_id=self.episode_id, phase=self.phase.value,
                 )
                 self._ui_call(self.status.set, f"Monitor error: {e}")
-            self.autoplay_input_gate.wait_or_wake(self._monitor_sleep_seconds())
+            time.sleep(self._monitor_sleep_seconds())
 
     def verify_last_result(self):
         if not self.episode_finalized:
@@ -4955,11 +4810,10 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
             self.last_verified_result = verified
             self._update_phase(result_visible=True)
             self.db.log_event(self.episode_id, "result-verified-manual", f"manual total {total_score}", self.phase.value, verified)
-            self.experience.train(
-                holdout_fraction=self.app_cfg.ml_holdout_fraction,
-                min_validation_games=self.app_cfg.ml_min_validation_games,
-            )
-            self.status.set(f"Manual result verified: total {total_score}.")
+            # Avoid blocking Tk/UI or the live solver with a full retrain.
+            self._post_game_maintenance_async(self.episode_id)
+            self._ui_call(self._refresh_learning_panel)
+            self.status.set(f"Manual result verified: total {total_score}. Learning queued in background.")
         except Exception as e:
             messagebox.showerror("Verify result", str(e))
 
@@ -4970,7 +4824,6 @@ Scores above 1000 are verified automatically after a trusted 14/14 completion. L
         an impossible 0/14-vs-4/14 desync when Reset was pressed mid-round. V5.6
         treats Reset as a tracking reset, not as proof that the screen is empty.
         """
-        self.autoplay_commit.invalidate()
         self._invalidate_recommendation("manual tracking reset", "Resetting tracking and synchronizing to the visible board...")
 
         synced_board = None

@@ -136,8 +136,8 @@ def _classify(samples: list[dict]) -> tuple[str, list[str]]:
         details.append(f"Commit state machine remained in {phase!r} for the complete capture window.")
         return f"COMMIT_{phase.upper().replace('-', '_')}_STUCK", details
 
-    if phase == "idle" and last.get("autoplay_enabled") and last.get("current_jewel") is None:
-        details.append("Auto Play is idle and no current jewel is accepted.")
+    if phase == "idle" and last.get("running") and last.get("current_jewel") is None:
+        details.append("Monitor is running and no current jewel is accepted.")
         return "WAITING_FOR_CURRENT_JEWEL", details
 
     if any(freeze_pending) or any(frozen) or any(fg) or any(bg) or any(bridge_active):
@@ -148,7 +148,7 @@ def _classify(samples: list[dict]) -> tuple[str, list[str]]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Capture a live Auto Play WAITING diagnostic bundle.")
+    parser = argparse.ArgumentParser(description="Capture a live monitor WAITING diagnostic bundle.")
     parser.add_argument("--seconds", type=float, default=12.0)
     parser.add_argument("--interval", type=float, default=0.5)
     args = parser.parse_args()

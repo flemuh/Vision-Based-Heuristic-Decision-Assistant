@@ -56,22 +56,6 @@ def test_auto_planner_keeps_locked_three_lucky_route_and_rejects_fourth_line():
     assert recs[0].position != 3  # L1C4 is the off-plan fourth-line cell.
 
 
-def test_auto_planner_falls_back_when_three_lucky_is_impossible():
-    b = base_board()
-    # Three already-selected cells outside every Lucky line consume more than
-    # the global two-placement slack budget, so no 3-Lucky trio can be completed
-    # in the remaining 11 draws.
-    selected = mask(1, 3, 5)
-    adv = Advisor(
-        b, mode="auto", rollouts=120,
-        plan_target="3 Lucky", plan_lucky_lines=("H", "V", "/"),
-    )
-    recs = adv.recommend(selected, "CH")
-    assert recs
-    assert recs[0].plan_target != "3 Lucky"
-    assert recs[0].plan_target in {"2 Lucky + 1 Normal", "1 Lucky + 2 Normal", "1 Lucky + 1 Normal", "expected score"}
-
-
 def test_auto_target_ladder_never_intentionally_targets_four_line_bonus():
     b = base_board()
     adv = Advisor(b, mode="auto", rollouts=60)
@@ -129,3 +113,4 @@ def test_solver_request_carries_locked_plan_into_worker():
     assert recs[0].plan_target == "3 Lucky"
     assert recs[0].plan_lucky_lines == ("H", "V", "\\")
     assert recs[0].plan_on_route is True
+

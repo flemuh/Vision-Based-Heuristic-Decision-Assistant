@@ -45,3 +45,6 @@ data/icon_templates/*.png
 *.sqlite-wal
 *.sqlite-shm
 data/solver_tmp/
+
+# CI benchmark smoke output
+benchmark-results/ci/

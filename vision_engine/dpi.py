@@ -1,7 +1,7 @@
 """Process DPI awareness bootstrap (V18.0.27 diagnostics patch).
 
 Must run before the first ``tkinter.Tk()`` and before ``mss`` is imported or
-instantiated, so Tk, mss, GetCursorPos and SetCursorPos all share the same
+instantiated, so Tk and mss share the same
 physical-pixel coordinate space. ``mss`` otherwise changes the process DPI
 awareness lazily on its first capture, after Tk's main thread already exists.
 """

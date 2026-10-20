@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import socketserver
 import threading
 
@@ -41,6 +42,7 @@ class SolverRequestHandler(socketserver.BaseRequestHandler):
                     "app_version": __version__,
                     "cache_entries": len(server.engine.cache),
                     "workers": server.engine.workers,
+                    "project_root": str(Path.cwd().resolve()),
                     **server.engine.status(),
                 })
             elif command == "shutdown":

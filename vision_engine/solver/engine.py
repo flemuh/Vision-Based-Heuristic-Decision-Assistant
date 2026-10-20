@@ -9,7 +9,7 @@ from threading import RLock
 from .cache import SolverLRUCache
 from .fence import GlobalSolverFence
 from .protocol import SolverRequest, SolverResponse
-from .worker import solve_hot_worker
+from .worker import solve_hot_worker, warm_worker
 
 
 class SolverEngine:
@@ -32,6 +32,8 @@ class SolverEngine:
         self._lock = RLock()
         self._pending: dict[str, object] = {}
         self._background_enabled = True
+        # Spawn the foreground worker while the user calibrates the board.
+        self._warm_future = self.foreground.submit(warm_worker)
 
     def close(self) -> None:
         # Service shutdown must not leave worker processes behind.
@@ -99,6 +101,45 @@ class SolverEngine:
             self.fence.begin_session("__direct__", 0.0)
         return "__direct__" if self.fence.session_id == "__direct__" else ""
 
+    @staticmethod
+    def _needs_refinement(recs) -> bool:
+        if len(recs) < 2:
+            return False
+        leader = recs[0]
+        if leader.method in {"immediate-lucky-fastpath", "reward-tier-exact"}:
+            return False
+        return bool(leader.primary_stat_tie or leader.tie_kind == "statistical"
+                    or leader.confidence in {"LOW_SAMPLE", "UNCERTAIN", "AMBIGUOUS", "TIED", "LOW"})
+
+    def _solve_adaptive(self, request: SolverRequest):
+        """Optional 120 -> 240 -> 500 -> 1000, only for *cheap ambiguous* moves.
+
+        The decision always begins with the user's normal live budget. Any
+        escalation must fit an estimated end-to-end compute budget; we do not
+        run a second 1,000-rollout solve after a slow 120-rollout answer.
+        """
+        from dataclasses import replace
+        started = time.perf_counter()
+        recs = self.foreground.submit(solve_hot_worker, request.to_legacy_request()).result()
+        consumed = (time.perf_counter() - started)
+        budget = int(request.settings.rollouts)
+        if request.purpose != "live-final" or budget >= 1000:
+            return recs, budget
+        limit = 1.2  # seconds of core compute, never a hard real-time guarantee
+        for next_budget in (240, 500, 1000):
+            if next_budget <= budget or not self._needs_refinement(recs):
+                break
+            # Conservative projection: expensive states skip refinement.
+            if consumed * (float(next_budget) / max(1, budget)) > limit:
+                break
+            increased = replace(request, settings=replace(request.settings, rollouts=next_budget))
+            recs = self.foreground.submit(solve_hot_worker, increased.to_legacy_request()).result()
+            consumed = time.perf_counter() - started
+            budget = next_budget
+            if consumed >= limit:
+                break
+        return recs, budget
+
     def solve(self, request: SolverRequest) -> SolverResponse:
         session_id = self._session_for(request)
         if not self.fence.enter_foreground(session_id):
@@ -113,12 +154,12 @@ class SolverEngine:
                     elapsed_ms=(time.perf_counter() - started) * 1000.0,
                     source="persistent-cache",
                 )
-            recs = self.foreground.submit(solve_hot_worker, request.to_legacy_request()).result()
+            recs, used_budget = self._solve_adaptive(request)
             self.cache.put(key, recs)
             return SolverResponse.for_request(
                 request, recs, cache_hit=False,
                 elapsed_ms=(time.perf_counter() - started) * 1000.0,
-                source="persistent-worker",
+                source=f"persistent-worker-{used_budget}",
             )
         finally:
             self.fence.leave_foreground()

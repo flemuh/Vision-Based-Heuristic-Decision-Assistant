@@ -1,3 +1,4 @@
--r requirements.txt
-pytest>=8.0
-pytesseract>=0.3.13  # legacy OCR tests/tools only; not used by live runtime
+-r requirements-benchmark.txt
+pytest>=8
+# Optional OCR used by result verification (also needs the Tesseract binary).
+pytesseract>=0.3.10

@@ -63,17 +63,16 @@ def test_runtime_requirements_do_not_install_test_or_ocr_stack():
     assert "pytesseract" in dev
 
 
-def test_physical_mouse_call_is_outside_live_state_lock_block():
+
+def test_public_build_never_sends_input_to_the_game():
+    """Recommendation-only build: no mouse/keyboard automation modules or calls."""
     root = Path(__file__).resolve().parents[1]
-    src = (root / "vision_engine" / "gui.py").read_text(encoding="utf-8")
-    fn = src[src.index("    def _execute_autoplay_click"):src.index("    def _autoplay_game_completed", src.index("    def _execute_autoplay_click"))]
-    marker = "with self._live_state_lock:"
-    move = "input_backend = self.input_executor.move_and_left_click("
-    i_lock = fn.index(marker)
-    i_move = fn.index(move)
-    assert i_lock < i_move
-    # The move call is dedented to the same level as the lock statement, so the
-    # lock protects state validation but not the physical 220-380 ms movement.
-    move_line = next(line for line in fn.splitlines() if move in line)
-    lock_line = next(line for line in fn.splitlines() if marker in line)
-    assert len(move_line) - len(move_line.lstrip()) == len(lock_line) - len(lock_line.lstrip())
+    engine = root / "vision_engine"
+    assert not (engine / "autoplay.py").exists()
+    assert not (engine / "input").exists()
+    assert not (engine / "live" / "input_executor.py").exists()
+    forbidden = ("SendInput", "SetCursorPos", "mouse_event", "keybd_event", "move_and_left_click", "pyautogui")
+    for path in engine.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        hits = [name for name in forbidden if name in text]
+        assert hits == [], f"{path.relative_to(root)} references {hits}"

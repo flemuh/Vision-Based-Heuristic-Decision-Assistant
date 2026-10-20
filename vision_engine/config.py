@@ -57,10 +57,10 @@ class AppConfig:
 
     # V7 live solver backend. Windows keeps capture/UI; the default WSL backend
     # keeps a persistent Linux solver hot across the whole play session.
-    solver_backend: str = "wsl"  # wsl, remote, or local
+    solver_backend: str = "native"  # native (Windows persistent), wsl, remote, local
     solver_host: str = "127.0.0.1"
-    solver_port: int = 57641
-    solver_workers: int = 8
+    solver_port: int = 57642
+    solver_workers: int = 2
     # Never rely on the global/default WSL distribution. Docker Desktop often
     # makes docker-desktop the default distro, which has no bash/python3.
     # The live solver uses this explicit Linux distro instead.
@@ -74,8 +74,26 @@ class AppConfig:
     # bounded horizon below so Monte-Carlo rollouts do not recursively enter
     # a 3-move exact solve on every sample.
     rollout_exact_horizon: int = 3
-    live_rollout_exact_horizon: int = 2
+    live_rollout_exact_horizon: int = 3
+    live_rollout_exact_horizon_max: int = 4
+
+    def live_horizon(self, mask: int, jewel_options: int, rollouts: int) -> int:
+        """Bounded 3/4 quality: 4 only for small, middle-game FINAL states.
+
+        FAST stage stays at 3, early states avoid explosive branching, and
+        late states are already covered by six-move exact Expectimax.
+        """
+        base = 3  # Ignore legacy saved 2-ply values in this 3/4 release.
+        if (int(self.live_rollout_exact_horizon_max) >= 4
+                and 3 <= int(mask).bit_count() <= 6
+                and 1 <= int(jewel_options) <= 2
+                and int(rollouts) >= int(self.live_rollouts)):
+            return 4
+        return base
     fast_rollouts: int = 60
+    # Small publishable preview; final answer still gets live_rollouts.
+    preview_rollouts: int = 24
+    progressive_live_decisions: bool = True
     # V7 live path uses a bounded publishable Monte-Carlo budget. The existing
     # 1600-rollout setting remains available to offline/research tools; exact
     # mid/endgame is unchanged. Speculative WSL precompute makes most live
@@ -137,28 +155,11 @@ class AppConfig:
     ml_holdout_fraction: float = 0.25
 
     # UI / capture. Overlay is OFF by default. Diagnostic disk I/O is also
-    # OFF by default so Auto Play correctness never depends on file-write timing.
+    # OFF by default so live decisions never depend on file-write timing.
     overlay_enabled: bool = False
     save_runtime_logs: bool = False
     save_game_images: bool = False
 
-    # V18.0.10 Auto Play TEST. Explicit, visible UI automation only. Timing is
-    # intentionally conservative so capture/animation/vision can settle before
-    # every action. Bounded variability is for UI robustness, not stealth or
-    # anti-cheat evasion. A pacing clock aims for ~51.4 s/round on a 700-game
-    # run (~10 h total) but never shortens these safety floors to catch up.
-    autoplay_click_delay_min_ms: int = 900
-    autoplay_click_delay_max_ms: int = 1600
-    autoplay_extra_settle_min_ms: int = 200
-    autoplay_extra_settle_max_ms: int = 700
-    autoplay_move_duration_min_ms: int = 220
-    autoplay_move_duration_max_ms: int = 380
-    autoplay_click_jitter_fraction: float = 0.18
-    autoplay_transition_timeout_ms: int = 6500
-    autoplay_target_game_seconds: float = 51.4
-    autoplay_expected_transition_ms: int = 550
-    autoplay_max_pacing_wait_ms: int = 4200
-    autoplay_default_games: int = 1
     auto_relocate: bool = True
     relocate_threshold: float = 0.80
     save_debug_frames: bool = False
@@ -196,31 +197,20 @@ class AppConfig:
         raw = json.loads(p.read_text(encoding="utf-8"))
         allowed = {f.name for f in fields(cls)}
         cfg = cls(**{k: v for k, v in raw.items() if k in allowed})
-        # V18.0.10: persistent user data deliberately keeps app_config.json
-        # across ZIP upgrades. Migrate only the exact V18.0.9 Auto Play timing
-        # defaults so user-customized timings are never overwritten.
-        legacy_autoplay_1809 = (
-            raw.get("autoplay_click_delay_min_ms") == 550
-            and raw.get("autoplay_click_delay_max_ms") == 950
-            and raw.get("autoplay_extra_settle_min_ms") == 50
-            and raw.get("autoplay_extra_settle_max_ms") == 500
-            and raw.get("autoplay_move_duration_min_ms") == 180
-            and raw.get("autoplay_move_duration_max_ms") == 320
-            and raw.get("autoplay_transition_timeout_ms") == 4500
-        )
-        if legacy_autoplay_1809:
-            cfg.autoplay_click_delay_min_ms = 900
-            cfg.autoplay_click_delay_max_ms = 1600
-            cfg.autoplay_extra_settle_min_ms = 200
-            cfg.autoplay_extra_settle_max_ms = 700
-            cfg.autoplay_move_duration_min_ms = 220
-            cfg.autoplay_move_duration_max_ms = 380
-            cfg.autoplay_transition_timeout_ms = 6500
         # V7.0.5 removes manual live strategy selection. Existing installations
         # migrate transparently to the automatic Win >1000 planner.
         if cfg.risk_profile in {"adaptive", "score", "lucky", "aggressive", "balanced", "conservative", "custom"}:
             cfg.risk_profile = "auto"
         cfg.apply_risk_profile()
+        # Opt in to the native service without altering the user's saved history.
+        import os
+        env_backend = os.environ.get("SPEEDLORA_SOLVER_BACKEND", "").strip().lower()
+        if env_backend in {"native", "wsl", "remote", "local"}:
+            cfg.solver_backend = env_backend
+            if env_backend == "native":
+                cfg.solver_host = "127.0.0.1"
+                cfg.solver_port = 57642
+                cfg.solver_workers = 2
         return cfg
 
     def apply_risk_profile(self) -> None:

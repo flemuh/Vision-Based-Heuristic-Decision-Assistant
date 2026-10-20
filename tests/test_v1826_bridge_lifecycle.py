@@ -5,7 +5,6 @@ import threading
 from pathlib import Path
 import time
 
-import pytest
 
 import vision_engine.live.solver_bridge as solver_bridge_module
 from vision_engine.live.solver_bridge import LiveSolverBridge

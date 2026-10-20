@@ -6,8 +6,6 @@ import cv2
 import numpy as np
 
 from vision_engine.icon_matcher import CurrentJewelMatcher
-from vision_engine.input.geometry import AutoPlayPoint
-from vision_engine.input.win32 import _cursor_within_tolerance
 from vision_engine.round_lifecycle import CompletionDetector
 from vision_engine.state_machine import GamePhase, GameStateMachine
 from vision_engine.temporal import TemporalStateFilter
@@ -52,12 +50,6 @@ def test_completion_detector_remembers_exactly_14_not_more():
     assert d.recent_full_mask is None
     d.observe(accepted_mask=_mask(13), raw_mask=_mask(14), jewel_visible=True)
     assert d.recent_full_mask == _mask(14)
-
-
-def test_cursor_tolerance_accepts_small_real_position_error_but_not_hard_block():
-    target = AutoPlayPoint(100, 100)
-    assert _cursor_within_tolerance(AutoPlayPoint(103, 104), target, 5)
-    assert not _cursor_within_tolerance(AutoPlayPoint(160, 100), target, 5)
 
 
 def test_cross_label_near_duplicate_is_removed_from_live_matching(tmp_path: Path):

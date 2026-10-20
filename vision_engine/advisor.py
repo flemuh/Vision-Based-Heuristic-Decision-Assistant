@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import random
 from dataclasses import dataclass, replace
+from collections import OrderedDict
 from itertools import combinations
 from typing import Callable
 
@@ -11,6 +13,7 @@ from .board import Board
 from .constants import JEWELS, JEWEL_INDEX, LUCKY_LINES, MAX_DRAWS, NORMAL_LINES
 from .scoring import LUCKY_MASKS, NORMAL_MASKS, score_mask
 from .strategy import move_line_impacts
+from .score_routes import best_score_route, is_score_route, guaranteed_score_floor
 from .route_math import (
     ROUTE_NOMINAL_SCORE, ROUTE_TARGETS, LuckySlackEstimate, RouteEstimate,
     best_lucky_slack, line_feasibilities, multivariate_at_least_probability, route_portfolio, route_probability,
@@ -39,6 +42,14 @@ class Utility:
             self.p3, self.p2l1n, self.p1l2n, self.p1l1n,
             self.p_gt1000, self.p_ge999, self.expected_score,
         )
+
+
+@dataclass(frozen=True)
+class RewardForecast:
+    """Exact endgame outcome of tier-first play; no future jewel is revealed live."""
+    utility: Utility
+    p_ge900: float
+    worst_score: int
 
 
 @dataclass(frozen=True)
@@ -101,6 +112,17 @@ class Recommendation:
     normal_clears_gained: int = 0
     endgame_value: float = 0.0
     terminal_move: bool = False
+    ml_matched: bool = False
+    ml_changed: bool = False
+    ml_baseline_pos: int | None = None
+    # Budget and guaranteed terminal floor of the concrete locked score route.
+    route_off_route: int = 0
+    route_slack_remaining: int = 0
+    route_score_floor: int = 0
+    # Exact reward-class diagnosis for the final decisions, not a Monte Carlo estimate.
+    reward_p_ge900: float = 0.0
+    reward_guarantee: str = ""
+    reward_min_final: int = 0
 
 
 def utility_learning_target(u: Utility) -> float:
@@ -158,6 +180,9 @@ class Advisor:
         auto_p3_floor: float = 0.04,
         auto_fallback_ratio: float = 3.0,
         route_switch_ratio: float = 1.35,
+        compiled_plan_features: bool | None = None,
+        policy_key_cache_enabled: bool = True,
+        lazy_slack_enabled: bool = True,
     ):
         self.board = board
         self.mode = mode
@@ -170,11 +195,16 @@ class Advisor:
         self.bias_weights = tuple(bias_weights or (1.0,) * 6)
         self.rng_seed = int(rng_seed)
         self._cache: dict[int, Utility] = {}
+        # Preserve identical Monte Carlo scenarios between FAST and REFINE.
+        # A bounded root cache is safe only with all policy-affecting state in
+        # the key; different state/plan/depth never reuse rollout samples.
+        self._root_sample_cache: OrderedDict[tuple, list[Utility]] = OrderedDict()
         # V18.0.12: policy-independent exact score cache used only for the
         # final two decisions when every >1000 finish is already impossible.
         # This prevents a stale structured fallback route from preferring a
         # lower-scoring Normal clear over an immediately banked Lucky line.
         self._score_exact_cache: dict[int, Utility] = {}
+        self._reward_exact_cache: dict[int, RewardForecast] = {}
         self.learned_action_scores = learned_action_scores
         self.thresholds = {
             "3 Lucky": float(p3_min),
@@ -193,6 +223,21 @@ class Advisor:
         self.auto_p3_floor = max(0.0, float(auto_p3_floor))
         self.auto_fallback_ratio = max(1.0, float(auto_fallback_ratio))
         self.route_switch_ratio = max(1.0, float(route_switch_ratio))
+        # R3.9: optional compiled route/score feature path. Keep live parity
+        # validation opt-in; Numba is never required for normal gameplay.
+        # The worker can pre-warm this at process startup before receiving a turn.
+        enabled = (
+            os.environ.get("SPEEDLORA_COMPILED_PLAN", "0") == "1"
+            if compiled_plan_features is None else bool(compiled_plan_features)
+        )
+        self._compiled_plan = None
+        self._compiled_board_bits = None
+        self._policy_key_cache_enabled = bool(policy_key_cache_enabled)
+        self._lazy_slack_enabled = bool(lazy_slack_enabled)
+        if enabled:
+            from .solver.r39_plan_kernel import board_bitmasks, kernel
+            self._compiled_plan = kernel()
+            self._compiled_board_bits = board_bitmasks(self.board)
 
         # Caches used by the rollout planning policy. They are intentionally
         # local to an Advisor instance/state request.
@@ -202,6 +247,7 @@ class Advisor:
         self._p3_route_cache: dict[int, float] = {}
         self._route_portfolio_cache: dict[int, tuple[RouteEstimate, ...]] = {}
         self._lucky_slack_cache: dict[int, LuckySlackEstimate] = {}
+        self._policy_key_cache: dict[tuple, tuple[float, ...]] = {}
         self._normal_leverage_cache: dict[int, float] = {}
         self._lucky_leverage_cache: dict[int, float] = {}
         self._rollout_goal: str = ">1000" if self.mode == "score" else ("3 Lucky" if self.mode in {"lucky", "auto"} else "")
@@ -287,6 +333,132 @@ class Advisor:
                 total = total + best.scale(p)
         self._score_exact_cache[mask] = total
         return total
+
+    @staticmethod
+    def _reward_key(forecast: RewardForecast) -> tuple[float, ...]:
+        """Reward bands first, within-band points last.
+
+        The ≥900 band guarantees one box, >1000 guarantees the next.  A merely
+        possible 999 is *not* allowed to replace a secured ≥900 reward.
+        Within equally secured bands, maximize the probability of ≥900 and
+        >1000, then expected score.  Guaranteed >1000 outranks guaranteed 900.
+        """
+        u = forecast.utility
+        return (
+            float(u.p_gt1000 >= 1.0 - 1e-12),
+            float(forecast.p_ge900 >= 1.0 - 1e-12),
+            forecast.p_ge900,
+            u.p_gt1000,
+            u.expected_score,
+        )
+
+    def _reward_endgame_state(self, mask: int) -> RewardForecast:
+        """Exact, policy-consistent reward tier probabilities for final turns.
+
+        The draw is averaged over remaining jewels.  The player may choose a
+        position only *after* the next jewel is seen, without foresight.
+        Uses the board-specific 4-of-each deck and caches intermediate states.
+        """
+        cached = self._reward_exact_cache.get(mask)
+        if cached is not None:
+            return cached
+        if mask.bit_count() >= MAX_DRAWS:
+            s = score_mask(mask)
+            out = RewardForecast(self._terminal(mask), float(s.total >= 900), s.total)
+            self._reward_exact_cache[mask] = out
+            return out
+        probs = self._draw_probabilities(mask)
+        if not probs:
+            s = score_mask(mask)
+            out = RewardForecast(self._terminal(mask), float(s.total >= 900), s.total)
+            self._reward_exact_cache[mask] = out
+            return out
+        result = Utility(0., 0., 0., 0., 0., 0., 0.)
+        p900 = 0.0
+        worst = math.inf
+        for jewel, chance in probs:
+            positions = self.board.legal_positions(jewel, mask)
+            if not positions:
+                continue
+            best = max(
+                (self._reward_endgame_state(mask | (1 << pos)) for pos in positions),
+                key=self._reward_key,
+            )
+            result = result + best.utility.scale(chance)
+            p900 += chance * best.p_ge900
+            worst = min(worst, best.worst_score)
+        out = RewardForecast(result, max(0.0, min(1.0, p900)), int(worst if math.isfinite(worst) else score_mask(mask).total))
+        self._reward_exact_cache[mask] = out
+        return out
+
+    def _reward_tier_fastpath(
+        self, mask: int, jewel: str, positions: tuple[int, ...]
+    ) -> list[Recommendation] | None:
+        """Secure a real reward box rather than speculate on points in its tier.
+
+        Exact final-turn evaluation is cheap for 12+/14 accepted jewels.
+        Also intercept an early guaranteed reward with 11 accepted jewels.
+        Do not change explicit legacy Lucky/Score policies, or use this when
+        the exact remaining horizon would be too expensive.
+        """
+        if self.mode != "auto" or mask.bit_count() < 11:
+            return None
+        # The player explicitly prioritizes the higher Lucky box while a
+        # real 3-Lucky continuation survives; only bank the safe 900+ tier
+        # after the next observed jewel has killed every 3-Lucky route.
+        if any(
+            self._best_three_lucky_route_probability(mask | (1 << pos)) > 1e-12
+            for pos in positions
+        ):
+            return None
+        forecasts = {
+            pos: self._reward_endgame_state(mask | (1 << pos))
+            for pos in positions
+        }
+        if mask.bit_count() == 11 and not any(
+            v.p_ge900 >= 1.0 - 1e-12 for v in forecasts.values()
+        ):
+            return None
+        ordered = sorted(positions, key=lambda pos: self._reward_key(forecasts[pos]), reverse=True)
+        self._rollout_goal = ">1000" if forecasts[ordered[0]].utility.p_gt1000 >= 1-1e-12 else ">=900"
+        self._active_plan_target = ""
+        self._active_plan_lucky_lines = ()
+        self._active_plan_normal_lines = ()
+        out = []
+        for pos in ordered:
+            forecast = forecasts[pos]
+            child = mask | (1 << pos)
+            impacts = move_line_impacts(mask, pos)
+            if forecast.utility.p_gt1000 >= 1.0 - 1e-12:
+                guarantee = ">1000 guaranteed"
+            elif forecast.p_ge900 >= 1.0 - 1e-12:
+                guarantee = "900+ guaranteed"
+            else:
+                guarantee = "not guaranteed"
+            out.append(Recommendation(
+                position=pos, utility=forecast.utility,
+                method="reward-tier-exact", active_goal=self._rollout_goal,
+                confidence="CLEAR", target_probability=(
+                    forecast.utility.p_gt1000 if self._rollout_goal == ">1000" else forecast.p_ge900
+                ),
+                plan_reason=(
+                    "reward-tier safety: bank the guaranteed box instead of gambling "
+                    "on more points in the same box tier"
+                ),
+                lucky_clears_gained=sum(
+                    1 for x in impacts if x.kind == "Lucky" and x.completed and x.before == x.size - 1
+                ),
+                normal_clears_gained=sum(
+                    1 for x in impacts if x.kind == "Normal" and x.completed and x.before == x.size - 1
+                ),
+                endgame_value=forecast.utility.expected_score,
+                terminal_move=mask.bit_count() == MAX_DRAWS - 1,
+                reward_p_ge900=forecast.p_ge900,
+                reward_guarantee=guarantee,
+                reward_min_final=forecast.worst_score,
+            ))
+        self._last_mc_samples = {}  # Exact analysis is never a Monte Carlo ML sample.
+        return out
 
     def _selected_counts(self, mask: int) -> tuple[int, ...]:
         return self.board.jewel_counts_in_mask(mask)
@@ -374,7 +546,7 @@ class Advisor:
             for pos in positions:
                 child_mask = mask | (1 << pos)
                 u = self._exact_state(child_mask)
-                if self._rollout_goal in {name for name, _l, _n in ROUTE_TARGETS}:
+                if self._rollout_goal in {">=999", *(name for name, _l, _n in ROUTE_TARGETS)}:
                     k = (*self._policy_key_for_mask(child_mask), *self._key(u))
                 else:
                     k = self._key(u)
@@ -454,6 +626,11 @@ class Advisor:
         cached = self._plan_cache.get(mask)
         if cached is not None:
             return cached
+        if self._compiled_plan is not None:
+            from .solver.r39_plan_kernel import compiled_features
+            result = compiled_features(mask, self._compiled_board_bits, self._compiled_plan)
+            self._plan_cache[mask] = result
+            return result
         s = score_mask(mask)
         remaining = MAX_DRAWS - mask.bit_count()
         lucky_probs = {
@@ -594,6 +771,25 @@ class Advisor:
             return (), ()
         return tuple(route.lucky_lines), tuple(route.normal_lines)
 
+    def _routes_for_current_jewel_candidates(
+        self, mask: int, positions: tuple[int, ...],
+    ) -> dict[int, tuple[RouteEstimate, ...]]:
+        """Run score-route search only when no 3-Lucky continuation survives.
+
+        Avoid adding the 184 geometry catalog to the normal fast path. The
+        score route is a *single-route witness*, not the probability of hitting
+        any winning route, because the route events overlap.
+        """
+        candidates = {pos: self._routes_for_mask(mask | (1 << pos)) for pos in positions}
+        if self.mode == "auto" and all(
+            route_probability(routes, "3 Lucky") <= 1e-12
+            for routes in candidates.values()
+        ):
+            for pos in positions:
+                child = mask | (1 << pos)
+                candidates[pos] = (*candidates[pos], best_score_route(self.board, child))
+        return candidates
+
     def _auto_target_from_candidates(
         self, candidate_routes: dict[int, tuple[RouteEstimate, ...]]
     ) -> tuple[str, str, dict[str, float]]:
@@ -626,18 +822,21 @@ class Advisor:
                 reason = "start with 3-Lucky primary target; a concrete 3-Lucky route is feasible"
             return "3 Lucky", reason, maxima
 
-        start_i = max(1, self._AUTO_LADDER.index(current) if current else 1)
-        for i in range(start_i, len(self._AUTO_LADDER)):
-            target = self._AUTO_LADDER[i]
-            p = maxima[target]
-            threshold = self.thresholds.get(target, 0.0)
-            if p >= threshold or (p > 1e-12 and i == len(self._AUTO_LADDER) - 1):
-                return target, "previous target weak/impossible after current jewel; automatic fallback", maxima
-            if p > 1e-12 and i + 1 < len(self._AUTO_LADDER):
-                next_p = maxima[self._AUTO_LADDER[i + 1]]
-                if next_p < max(self.thresholds.get(self._AUTO_LADDER[i + 1], 0.0), p * self.auto_fallback_ratio):
-                    return target, "keep current fallback after current-jewel check", maxima
-        return "expected score", "all structured targets impossible after current jewel; best-score salvage", maxima
+        # Once 3 Lucky is impossible with the jewel *already visible*, prefer
+        # a route whose concrete geometry guarantees >=999. The old generic
+        # '2 Lucky + 1 Normal' label sometimes yielded only 954, and could
+        # overlook 1 Lucky + 3 Normal or 2 Lucky + 2 Normal winning routes.
+        score_witness = max(
+            (route_probability(routes, ">=999") for routes in candidate_routes.values()),
+            default=0.0,
+        )
+        if score_witness > 1e-12:
+            return ">=999", "3 Lucky impossible after current jewel; pursue score-proven >=999 route", {**maxima, ">=999": score_witness}
+
+        # No route reaching >=999 survives the visible jewel. Avoid displaying
+        # the old 2-Lucky+1-Normal nominal '999' label (some yield 954).
+        # Use score-maximizing salvage instead of promising a dead goal.
+        return "expected score", "3 Lucky and >=999 are structurally impossible after current jewel; maximize achievable points", maxima
 
     def _select_locked_plan_for_current_jewel(
         self,
@@ -728,6 +927,10 @@ class Advisor:
         route is easier than the actual target and must never receive
         hysteresis protection in a later decision.
         """
+        if target == ">=999":
+            # A persisted fallback must still represent a geometry whose
+            # score floor really is >=999, not an arbitrary nominal label.
+            return is_score_route(tuple(lucky_lines), tuple(normal_lines))
         lucky_target, normal_target = cls._route_target_counts(target)
         return (
             len(tuple(dict.fromkeys(lucky_lines))) == lucky_target
@@ -819,21 +1022,10 @@ class Advisor:
                 return "3 Lucky", "recover 3-Lucky primary route from premature fallback"
             return "3 Lucky", "start with feasible 3-Lucky primary route"
 
-        start_i = max(1, self._AUTO_LADDER.index(current) if current else 1)
-        for i in range(start_i, len(self._AUTO_LADDER)):
-            target = self._AUTO_LADDER[i]
-            p = probs[target]
-            threshold = self.thresholds.get(target, 0.0)
-            if p >= threshold or (p > 1e-12 and i == len(self._AUTO_LADDER) - 1):
-                reason = "previous target weak/impossible; automatic fallback"
-                return target, reason
-            # If this target is still physically possible but below threshold,
-            # keep it unless the next fallback is clearly healthier.
-            if p > 1e-12 and i + 1 < len(self._AUTO_LADDER):
-                next_p = probs[self._AUTO_LADDER[i + 1]]
-                if next_p < max(self.thresholds.get(self._AUTO_LADDER[i + 1], 0.0), p * self.auto_fallback_ratio):
-                    return target, "keep current fallback route"
-        return "expected score", "all structured win/fallback routes exhausted"
+        winner = best_score_route(self.board, mask)
+        if winner.probability > 1e-12:
+            return ">=999", "3 Lucky impossible; score-proven >=999 route feasible"
+        return "expected score", "3 Lucky and >=999 impossible; maximize achievable score"
 
     def _select_locked_plan(self, mask: int) -> tuple[str, RouteEstimate | None, str]:
         target, reason = self._auto_target(mask)
@@ -857,6 +1049,24 @@ class Advisor:
         return "expected score", None, "target route impossible; best-score salvage"
 
     @staticmethod
+    def _plan_budget(mask: int, route: RouteEstimate | None) -> tuple[int, int, int]:
+        if route is None:
+            return (0, 0, 0)
+        required = 0
+        for name in route.lucky_lines:
+            required |= LUCKY_MASKS[name]
+        for name in route.normal_lines:
+            required |= NORMAL_MASKS[name]
+        if not required:
+            return (0, 0, 0)
+        outside = (mask & ~required).bit_count()
+        return (
+            outside,
+            max(0, MAX_DRAWS - required.bit_count() - outside),
+            guaranteed_score_floor(route.lucky_lines, route.normal_lines),
+        )
+
+    @staticmethod
     def _position_in_plan(position: int, route: RouteEstimate | None) -> bool:
         if route is None:
             return False
@@ -868,66 +1078,91 @@ class Advisor:
                 return True
         return False
 
+    def _policy_key_context(self) -> tuple:
+        return (
+            self.mode,
+            self._rollout_goal,
+            self._active_plan_target,
+            tuple(self._active_plan_lucky_lines),
+            tuple(self._active_plan_normal_lines),
+            self.plan_target,
+            tuple(self.plan_lucky_lines),
+            tuple(self.plan_normal_lines),
+        )
+
     def _policy_key_for_mask(self, mask: int) -> tuple[float, ...]:
+        cache_key = None
+        if self._policy_key_cache_enabled:
+            cache_key = (mask, self._policy_key_context())
+            cached = self._policy_key_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         plan = self._plan_features(mask)
         s = score_mask(mask)
-        slack = self._slack_for_mask(mask)
-        slack_key = (
-            float(slack.slack_remaining) if slack.viable else -1.0,
-            float(slack.probability) if slack.viable else 0.0,
-        )
         lucky_key = (
             plan["p3_route"], plan["lucky_sum"], plan["score_proxy"],
             plan["best_normal"], float(s.total),
         )
-        score_key = (
-            plan["score_proxy"], *slack_key, plan["best_normal"], plan["normal_sum"],
-            plan["p3_route"], plan["best_lucky"], float(s.total),
-        )
+
         goal = self._rollout_goal
-        if self.mode == "auto" and self._active_plan_target in {name for name, _l, _n in ROUTE_TARGETS}:
+        if self.mode == "auto" and self._active_plan_target in {">=999", *(name for name, _l, _n in ROUTE_TARGETS)}:
             locked = specific_route_feasibility(
                 self.board, mask, self._active_plan_target,
                 self._active_plan_lucky_lines, self._active_plan_normal_lines,
             )
-            return (
+            out = (
                 locked.probability,
                 -float(locked.missing_cells),
                 plan["score_proxy"], plan["best_normal"], plan["p3_route"], float(s.total),
             )
-        if goal in {name for name, _l, _n in ROUTE_TARGETS}:
+            if cache_key is not None:
+                self._policy_key_cache[cache_key] = out
+            return out
+
+        score_key = None
+        if goal in {">1000", ">=999", "expected score"} or self.mode == "score":
+            slack = self._slack_for_mask(mask)
+            slack_key = (
+                float(slack.slack_remaining) if slack.viable else -1.0,
+                float(slack.probability) if slack.viable else 0.0,
+            )
+            score_key = (
+                plan["score_proxy"], *slack_key, plan["best_normal"], plan["normal_sum"],
+                plan["p3_route"], plan["best_lucky"], float(s.total),
+            )
+
+        if goal in {">=999", *(name for name, _l, _n in ROUTE_TARGETS)}:
             lucky_target, normal_target = self._route_target_counts(goal)
-            # Keep rollout policy target-specific without running the much more
-            # expensive full route-portfolio enumerator at every simulated node.
-            # Exact route probabilities are still computed for the real candidate
-            # actions and are the primary ranking metric.
             lucky_progress = min(s.lucky, lucky_target) / lucky_target if lucky_target else 1.0
             normal_progress = min(s.normal, normal_target) / normal_target if normal_target else 1.0
-            return (
+            out = (
                 lucky_progress + normal_progress,
                 float(s.lucky), float(s.normal),
                 plan["lucky_sum"] if lucky_target else 0.0,
                 plan["normal_sum"] if normal_target else 0.0,
                 plan["best_lucky"], plan["best_normal"], plan["score_proxy"], float(s.total),
             )
-        if goal in {">1000", ">=999", "expected score"}:
-            return score_key
-        if self.mode == "lucky":
-            return lucky_key
-        if self.mode == "score":
-            return score_key
-        if plan["p3_route"] >= self.thresholds["3 Lucky"]:
-            return lucky_key
-        return (
-            plan["best_normal"], plan["normal_sum"], plan["score_proxy"],
-            plan["best_lucky"], float(s.total),
-        )
+        elif self.mode == "lucky":
+            out = lucky_key
+        elif goal in {">1000", ">=999", "expected score"}:
+            out = score_key
+        elif plan["p3_route"] >= self.thresholds["3 Lucky"]:
+            out = lucky_key
+        else:
+            out = (
+                plan["best_normal"], plan["normal_sum"], plan["score_proxy"],
+                plan["best_lucky"], float(s.total),
+            )
+        if cache_key is not None:
+            self._policy_key_cache[cache_key] = out
+        return out
 
     def _policy_position(self, mask: int, jewel: str) -> int:
         positions = self.board.legal_positions(jewel, mask)
         if not positions:
             raise ValueError(f"No legal positions left for {jewel}")
-        if self.mode == "auto" and self._active_plan_target in {name for name, _l, _n in ROUTE_TARGETS}:
+        if self.mode == "auto" and self._active_plan_target in {">=999", *(name for name, _l, _n in ROUTE_TARGETS)}:
             route = RouteEstimate(
                 self._active_plan_target, 0.0,
                 lucky_lines=self._active_plan_lucky_lines,
@@ -1022,10 +1257,22 @@ class Advisor:
         key = (mask, current_jewel, n)
         if self._active_common_key != key or len(self._active_common_sequences) != n:
             self._prepare_common_sequences(mask, current_jewel, n)
-        vals = [
-            self._rollout_after_action(mask | (1 << pos), sequence)
-            for sequence in self._active_common_sequences
-        ]
+        sample_key = (
+            mask, current_jewel, pos, self._rollout_goal,
+            self._active_plan_target, self._active_plan_lucky_lines,
+            self._active_plan_normal_lines, self.rollout_exact_horizon,
+        )
+        previous = self._root_sample_cache.get(sample_key)
+        if previous is None:
+            previous = []
+            self._root_sample_cache[sample_key] = previous
+            if len(self._root_sample_cache) > 48:
+                self._root_sample_cache.popitem(last=False)
+        else:
+            self._root_sample_cache.move_to_end(sample_key)
+        for sequence in self._active_common_sequences[len(previous):n]:
+            previous.append(self._rollout_after_action(mask | (1 << pos), sequence))
+        vals = previous[:n]
         self._last_mc_samples[pos] = vals
         total = Utility(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         for u in vals:
@@ -1085,7 +1332,7 @@ class Advisor:
 
     def _sort_tuple_for_goal(self, r: Recommendation, goal: str) -> tuple[float, ...]:
         u = r.utility
-        if goal in {name for name, _l, _n in ROUTE_TARGETS}:
+        if goal in {">=999", *(name for name, _l, _n in ROUTE_TARGETS)}:
             # V7.0.5 automatic live play follows one concrete locked route.
             # When feasibility is equal, an on-route cell always beats spending
             # a placement on a fourth/unrelated line.
@@ -1149,7 +1396,7 @@ class Advisor:
 
     def _criteria_for_goal(self, r: Recommendation, goal: str) -> list[tuple[str, float, str | None]]:
         u = r.utility
-        if goal in {name for name, _l, _n in ROUTE_TARGETS}:
+        if goal in {">=999", *(name for name, _l, _n in ROUTE_TARGETS)}:
             if self.mode == "auto" and r.plan_target == goal:
                 if r.terminal_move:
                     return [
@@ -1370,17 +1617,155 @@ class Advisor:
                 ))
         return out
 
+    def _immediate_lucky_fastpath(
+        self, mask: int, jewel: str, positions: tuple[int, ...]
+    ) -> list[Recommendation] | None:
+        """Skip Monte Carlo only for an unambiguous, target-safe Lucky closure.
+
+        The observed jewel must legally occupy the last cell of a Lucky line.
+        If that move already guarantees >1000 or the 3-Lucky objective, the
+        decision is settled. Otherwise a cheap *structural* guard requires
+        the move to preserve the best current-jewel target and locked route.
+        Ambiguous closures and compromised routes keep the regular solver.
+
+        These results do NOT claim predicted win probabilities: the Utility
+        expresses outcomes guaranteed by the currently selected cells only.
+        """
+        closures = {}
+        for pos in positions:
+            names = tuple(
+                impact.name for impact in move_line_impacts(mask, pos)
+                if impact.kind == "Lucky" and impact.completed and impact.before == impact.size - 1
+            )
+            if names:
+                closures[pos] = names
+        if not closures:
+            return None
+        max_closures = max(map(len, closures.values()))
+        top = [pos for pos, names in closures.items() if len(names) == max_closures]
+        if len(top) != 1:
+            return None  # Multiple immediate closes: compare with full solver.
+        chosen = top[0]
+        chosen_score = score_mask(mask | (1 << chosen))
+        guaranteed_score = chosen_score.total > 1000
+        guaranteed_three = chosen_score.lucky >= 3
+        # No automatic shortcut if another cell already guarantees >1000 but
+        # does not close Lucky: we need a proper score/tiebreak comparison.
+        if not guaranteed_score and any(
+            score_mask(mask | (1 << p)).total > 1000 for p in positions
+        ):
+            return None
+
+        goal = ">1000" if self.mode == "score" else "3 Lucky" if self.mode == "lucky" else ""
+        active_plan = None
+        reason = "immediate deterministic Lucky closure"
+        switched = False
+        candidate_routes = {}
+        if self.mode == "auto":
+            candidate_routes = self._routes_for_current_jewel_candidates(mask, positions)
+            goal, active_plan, reason, switched = self._select_locked_plan_for_current_jewel(
+                mask, positions, candidate_routes
+            )
+            self._rollout_goal = goal
+            self._active_plan_target = goal
+            self._active_plan_lucky_lines = active_plan.lucky_lines if active_plan else ()
+            self._active_plan_normal_lines = active_plan.normal_lines if active_plan else ()
+        guaranteed_goal = guaranteed_score or (guaranteed_three and goal == "3 Lucky")
+        if not guaranteed_goal:
+            # Avoid a false quick winner in score/adaptive/legacy modes. Route
+            # equality is only meaningful for the automatic structured target.
+            if self.mode != "auto" or active_plan is None or goal == "expected score":
+                return None
+            if not self._position_in_plan(chosen, active_plan):
+                return None
+            probs = {p: route_probability(candidate_routes[p], goal) for p in positions}
+            chosen_prob = probs[chosen]
+            if chosen_prob <= 1e-12 or chosen_prob + 1e-12 < max(probs.values()):
+                return None
+            plan_probs = {}
+            for p in positions:
+                plan_probs[p] = specific_route_feasibility(
+                    self.board, mask | (1 << p), goal,
+                    active_plan.lucky_lines, active_plan.normal_lines,
+                ).probability
+            if plan_probs[chosen] <= 1e-12 or plan_probs[chosen] + 1e-12 < max(plan_probs.values()):
+                return None
+            # Preserving the chance to finish a known route is a necessary
+            # condition; the fast-path intentionally banks an assured Lucky
+            # when alternatives are structurally equivalent.
+
+        raw = []
+        for pos in positions:
+            child = mask | (1 << pos)
+            score = score_mask(child)
+            u = self._terminal(child)  # guaranteed CURRENT results, not MC estimates
+            impacts = move_line_impacts(mask, pos)
+            gains = sum(x.kind == "Lucky" and x.completed and x.before == x.size - 1 for x in impacts)
+            normal_gains = sum(x.kind == "Normal" and x.completed and x.before == x.size - 1 for x in impacts)
+            routes = candidate_routes.get(pos, ())
+            target_p = route_probability(routes, goal) if routes else float(u.p3 if goal == "3 Lucky" else u.p_gt1000)
+            plan_p = (
+                specific_route_feasibility(
+                    self.board, child, goal, active_plan.lucky_lines, active_plan.normal_lines
+                ).probability if active_plan is not None else 0.0
+            )
+            raw.append(Recommendation(
+                position=pos, utility=u, method="immediate-lucky-fastpath",
+                active_goal=goal, confidence="CLEAR", routes=routes,
+                tie_break_metric="Immediate Lucky clears" if pos == chosen else "",
+                tie_break_margin=float(gains) if pos == chosen else 0.0,
+                plan_target=goal if active_plan else "",
+                plan_lucky_lines=active_plan.lucky_lines if active_plan else (),
+                plan_normal_lines=active_plan.normal_lines if active_plan else (),
+                target_probability=target_p,
+                plan_probability=plan_p,
+                plan_on_route=self._position_in_plan(pos, active_plan) if active_plan else False,
+                plan_reason=reason, route_switched=switched,
+                lucky_clears_gained=int(gains), normal_clears_gained=int(normal_gains),
+                terminal_move=mask.bit_count() == MAX_DRAWS - 1,
+                endgame_value=float(score.total),
+                route_off_route=self._plan_budget(child, active_plan)[0],
+                route_slack_remaining=self._plan_budget(child, active_plan)[1],
+                route_score_floor=self._plan_budget(child, active_plan)[2],
+            ))
+        raw.sort(key=lambda r: (r.position != chosen, -r.lucky_clears_gained, -r.endgame_value))
+        self._last_mc_samples = {}
+        return raw
+
     def recommend(self, mask: int, current_jewel: str) -> list[Recommendation]:
         positions = self.board.legal_positions(current_jewel, mask)
         if not positions:
             raise ValueError(f"No legal positions left for {current_jewel}")
+
+        # Preserve the original zero-rollout shortcut when a Lucky closure
+        # already secures the *higher* reward box (>1000) right now.
+        if self.mode == "auto" and any(
+            score_mask(mask | (1 << pos)).total > 1000
+            and any(x.kind == "Lucky" and x.completed and x.before == x.size - 1
+                    for x in move_line_impacts(mask, pos))
+            for pos in positions
+        ):
+            immediate_win = self._immediate_lucky_fastpath(mask, current_jewel, positions)
+            if immediate_win is not None:
+                return immediate_win
+
+        # Reward tier protection takes precedence over speculative route rank.
+        # Evaluated before the immediate-Lucky shortcut so a guaranteed >=900
+        # Normal clear is not sacrificed for a conditional >=999 of the same tier.
+        reward_tier = self._reward_tier_fastpath(mask, current_jewel, positions)
+        if reward_tier is not None:
+            return reward_tier
+
+        immediate = self._immediate_lucky_fastpath(mask, current_jewel, positions)
+        if immediate is not None:
+            return immediate
 
         learned = (
             self.learned_action_scores(mask, current_jewel, positions)
             if self.learned_action_scores is not None
             else {p: 0.0 for p in positions}
         )
-        candidate_routes = {p: self._routes_for_mask(mask | (1 << p)) for p in positions}
+        candidate_routes = self._routes_for_current_jewel_candidates(mask, positions)
         candidate_slack = {p: self._slack_for_mask(mask | (1 << p)) for p in positions}
         active_plan: RouteEstimate | None = None
         plan_reason = ""
@@ -1489,6 +1874,9 @@ class Advisor:
                 ),
                 endgame_value=u.expected_score if future_after_move <= 1 else 0.0,
                 terminal_move=future_after_move == 0,
+                route_off_route=self._plan_budget(child_mask, active_plan)[0] if not salvage else 0,
+                route_slack_remaining=self._plan_budget(child_mask, active_plan)[1] if not salvage else 0,
+                route_score_floor=self._plan_budget(child_mask, active_plan)[2] if not salvage else 0,
             ))
         if not endgame_salvage_goal and self.mode == "auto" and active_plan is not None and self._rollout_goal == "3 Lucky":
             forced_slack = not any(r.plan_on_route for r in preliminary)
@@ -1510,14 +1898,21 @@ class Advisor:
         recs = self._hierarchical_sort(recs, goal, exact_now)
         recs = self._annotate_ties(recs, goal, exact_now)
 
-        # ML may break only a true mathematical/statistical tie; it may never
-        # override a hierarchy criterion that already separated the moves.
-        if recs and recs[0].confidence == "TIE" and self.learned_action_scores is not None:
-            tie_positions = {recs[0].position, *recs[0].tied_with}
-            tie_group = [r for r in recs if r.position in tie_positions]
-            rest = [r for r in recs if r.position not in tie_positions]
-            tie_group.sort(key=lambda r: r.learned_score, reverse=True)
-            recs = tie_group + rest
+        # Record a reproducible control decision for later offline analysis:
+        # whether an EXACT factual history existed and whether it changed a
+        # genuine tie. Do not claim an unmeasured improvement in win rate.
+        if recs:
+            baseline_pos = recs[0].position
+            matched = any(r.learned_score > 0.0 for r in recs)
+            if recs[0].confidence == "TIE" and self.learned_action_scores is not None:
+                tie_positions = {recs[0].position, *recs[0].tied_with}
+                tie_group = [r for r in recs if r.position in tie_positions]
+                rest = [r for r in recs if r.position not in tie_positions]
+                tie_group.sort(key=lambda r: r.learned_score, reverse=True)
+                recs = tie_group + rest
+            changed = recs[0].position != baseline_pos
+            recs = [replace(r, ml_matched=matched, ml_changed=changed,
+                            ml_baseline_pos=baseline_pos) for r in recs]
 
         if recs:
             best_target = utility_learning_target(recs[0].utility)

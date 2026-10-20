@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-benchmark.txt
+      - name: Run test suite
+        run: python -m pytest -q
+      - name: Benchmark smoke test (small budget, decision parity enforced)
+        run: python tools/benchmark_compare.py --rollouts 16 60 --repeats 1 --output benchmark-results/ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-ci-py${{ matrix.python-version }}
+          path: benchmark-results/ci

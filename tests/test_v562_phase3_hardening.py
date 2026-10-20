@@ -43,7 +43,7 @@ def test_schema_persists_reproducibility_and_route_metadata(tmp_path):
         cols = {row[1] for row in con.execute("PRAGMA table_info(decision_samples)")}
         assert {"rng_seed", "scenario_set", "routes_json", "primary_stat_tie", "tie_break_metric"} <= cols
         version = con.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0]
-        assert int(version) == SCHEMA_VERSION == 9
+        assert int(version) == SCHEMA_VERSION == 10
 
 
 def test_decision_metadata_round_trips_route_and_scenario_fields(tmp_path):

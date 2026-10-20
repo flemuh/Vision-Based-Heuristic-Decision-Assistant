@@ -43,7 +43,7 @@ def test_classifier_identifies_clean_await_confirm_as_vision_stall():
                 "monitor_quiesced": False,
                 "monitor_requested": False,
                 "bridge_admission": {"open": True, "active": 0},
-                "autoplay_enabled": True,
+                "running": True,
                 "current_jewel": "HA",
             }},
             "solver": {
@@ -67,7 +67,7 @@ def test_classifier_identifies_solver_fence_release_stuck():
                 "monitor_quiesced": False,
                 "monitor_requested": False,
                 "bridge_admission": {"open": False, "active": 0},
-                "autoplay_enabled": True,
+                "running": True,
                 "current_jewel": "HA",
             }},
             "solver": {
@@ -84,5 +84,3 @@ def test_release_contains_one_click_waiting_diagnostic_script():
     assert (root / "diagnose_waiting.bat").exists()
     gui = (root / "vision_engine" / "gui.py").read_text(encoding="utf-8")
     assert "WaitingDiagnostics" in gui
-    assert "transition-watchdog-armed" in gui
-    assert "click-confirmed" in gui

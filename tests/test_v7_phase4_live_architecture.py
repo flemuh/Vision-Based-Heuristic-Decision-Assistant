@@ -2,9 +2,7 @@ import threading
 import time
 from pathlib import Path
 
-from vision_engine.config import AppConfig
 from vision_engine.live.coordinator import LiveCoordinator
-from vision_engine.live.solver_bridge import LiveSolverBridge
 from vision_engine.live.state import GameState
 from vision_engine.solver.client import SolverClient
 from vision_engine.solver.protocol import SolverRequest, SolverSettings
@@ -53,18 +51,10 @@ def test_coordinator_versions_are_absolute_publish_contract():
     assert c.state.strategy_version == 2
 
 
-def test_packaged_v7_config_prefers_wsl_and_fast_live_polling():
-    cfg=AppConfig.load(Path(__file__).parents[1]/"data"/"app_config.json")
-    assert cfg.solver_backend == "wsl"
-    assert cfg.solver_port == 57641
-    assert cfg.solver_wsl_distro == "Ubuntu"
-    assert cfg.poll_ms <= 100
-    assert cfg.transition_poll_ms <= 50
-
-
 def test_gui_source_uses_final_remote_decision_and_precompute():
     src=(Path(__file__).parents[1]/"vision_engine"/"gui.py").read_text(encoding="utf-8")
     assert "_start_remote_solver" in src
     assert "_schedule_precompute" in src
     assert "coord.accepts(response)" in src
     assert "self._render_recommendations(mask, jewel, recs, refined=True)" in src
+

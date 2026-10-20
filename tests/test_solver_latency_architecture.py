@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 
 from vision_engine.config import AppConfig
 from vision_engine.solver.engine import SolverEngine
@@ -46,7 +45,7 @@ def _request(scores=None):
 def test_live_horizon_is_bounded_without_changing_offline_default():
     cfg = AppConfig()
     assert cfg.rollout_exact_horizon == 3
-    assert cfg.live_rollout_exact_horizon == 2
+    assert cfg.live_rollout_exact_horizon == 3  # v18.0.26 reference quality
     assert cfg.exact_horizon == 6
 
 

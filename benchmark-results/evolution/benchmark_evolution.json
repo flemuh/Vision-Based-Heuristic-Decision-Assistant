@@ -1,0 +1,75 @@
+{
+  "machine": "Windows-11-10.0.26200-SP0",
+  "machine_short": "Windows \u00b7 24 CPUs \u00b7 Python 3.12.10",
+  "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "cpu_count": 24,
+  "python": "3.12.10",
+  "numba": "0.68.0",
+  "jit_warmup_s": 4.588745699991705,
+  "repeats": 5,
+  "variants": {
+    "python": "Pure Python route features",
+    "numba": "Numba-compiled route features",
+    "numba_cache": "Numba + context-aware policy-key cache"
+  },
+  "all_decisions_identical": true,
+  "results": [
+    {
+      "rollouts": 120,
+      "median_s": {
+        "python": 2.258508900005836,
+        "numba": 0.8057877000101143,
+        "numba_cache": 0.5769831000070553
+      },
+      "speedup_vs_python": {
+        "python": 1.0,
+        "numba": 2.8028584948336728,
+        "numba_cache": 3.9143415118713514
+      },
+      "reduction_pct_vs_python": {
+        "python": 0.0,
+        "numba": 64.32213749487407,
+        "numba_cache": 74.45291891452965
+      },
+      "cache_gain_vs_numba_pct": 28.395146761384794
+    },
+    {
+      "rollouts": 1000,
+      "median_s": {
+        "python": 4.269834999999148,
+        "numba": 2.191144100012025,
+        "numba_cache": 1.4394636999932118
+      },
+      "speedup_vs_python": {
+        "python": 1.0,
+        "numba": 1.9486783183158585,
+        "numba_cache": 2.9662679232684255
+      },
+      "reduction_pct_vs_python": {
+        "python": 0.0,
+        "numba": 48.68316691365212,
+        "numba_cache": 66.28760361949585
+      },
+      "cache_gain_vs_numba_pct": 34.30538411484155
+    },
+    {
+      "rollouts": 10000,
+      "median_s": {
+        "python": 6.417319699990912,
+        "numba": 3.9323217000055593,
+        "numba_cache": 2.483726899998146
+      },
+      "speedup_vs_python": {
+        "python": 1.0,
+        "numba": 1.6319416847258046,
+        "numba_cache": 2.583746103484929
+      },
+      "reduction_pct_vs_python": {
+        "python": 0.0,
+        "numba": 38.723300632643756,
+        "numba_cache": 61.29650670198552
+      },
+      "cache_gain_vs_numba_pct": 36.838155942464354
+    }
+  ]
+}
