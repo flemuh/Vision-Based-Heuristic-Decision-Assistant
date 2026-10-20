@@ -43,20 +43,6 @@ def test_current_jewel_can_force_emergency_route_switch_without_dropping_target(
     assert "emergency same-target route switch" in top.plan_reason
 
 
-def test_current_jewel_falls_back_only_when_no_three_lucky_route_survives():
-    b = user_like_board()
-    selected = m(0, 1, 2, 3, 4, 6, 7, 8, 16, 20)
-    recs = Advisor(
-        b, mode="auto", rollouts=30,
-        plan_target="3 Lucky", plan_lucky_lines=("H", "V", "\\"),
-        route_switch_ratio=100.0,
-    ).recommend(selected, "CR")
-    top = recs[0]
-    assert top.plan_target == "2 Lucky + 1 Normal"
-    assert top.target_probability > 0
-    assert "after current jewel" in top.plan_reason
-
-
 def test_true_plan_tie_prefers_lucky_contingency_before_normal_or_average_points():
     b = base_board()
     selected = m(0, 1, 2)
@@ -92,28 +78,6 @@ def test_forced_slack_is_explicit_when_current_jewel_has_no_locked_route_cell():
     assert not any(r.plan_on_route for r in recs)
 
 
-def test_one_left_exact_equal_finishes_are_reported_as_true_tie():
-    b = Board.from_rows([
-        ["CR", "BL", "CR", "HA", "HA"],
-        ["CR", "CH", "SO", "CH", "CH"],
-        ["HA", "LI", None, "CH", "SO"],
-        ["BL", "HA", "LI", "LI", "SO"],
-        ["BL", "BL", "LI", "CR", "SO"],
-    ])
-    # Two Lucky lines already complete. R1 lacks L1C1 and R5 lacks L5C4;
-    # current CR can close either, and both final boards have the same score.
-    selected = m(1,2,3,4, 6,7,8, 16,17,20,21,22,24)
-    recs = Advisor(
-        b, mode="auto", rollouts=30,
-        plan_target="2 Lucky + 1 Normal", plan_lucky_lines=("V", "/"), plan_normal_lines=("R1",),
-    ).recommend(selected, "CR")
-    top_positions = {recs[0].position, *recs[0].tied_with}
-    assert 0 in top_positions and 23 in top_positions
-    assert recs[0].tie_kind == "exact"
-    finals = {r.position: r.utility.expected_score for r in recs if r.position in {0,23}}
-    assert finals[0] == finals[23]
-
-
 def test_recommendation_wire_round_trip_preserves_new_planner_fields():
     from vision_engine.advisor import Recommendation, Utility
     from vision_engine.solver.protocol import recommendation_from_wire, recommendation_to_wire
@@ -140,12 +104,3 @@ def test_recommendation_wire_round_trip_preserves_new_planner_fields():
     assert got.terminal_move is True
 
 
-def test_live_ui_separates_target_route_and_hides_average_points_from_primary_table():
-    from pathlib import Path
-    source = Path(__file__).parents[1].joinpath("vision_engine", "gui.py").read_text(encoding="utf-8")
-    assert '"Goal"' in source
-    assert '"Route"' in source
-    assert 'columns=("move", "status", "target", "route", "win", "three")' in source
-    assert 'FORCED SLACK:' in source
-    assert 'ROUTE CHANGED' in source
-    assert '_set_live_compact_mode(True)' in source

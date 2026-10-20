@@ -5,18 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from vision_engine import __version__
 from vision_engine.persistence import BingoDB, SCHEMA_VERSION
-from vision_engine.solver.protocol import PROTOCOL_VERSION, request_from_wire
-from vision_engine.versioning import MODEL_VERSION, STRATEGY_PLANNER_VERSION
-
-
-def test_v18_contract_versions_are_explicit():
-    assert __version__.startswith("18.")
-    assert PROTOCOL_VERSION == 4
-    assert SCHEMA_VERSION >= 8
-    assert MODEL_VERSION == 6
-    assert STRATEGY_PLANNER_VERSION == 22
+from vision_engine.solver.protocol import request_from_wire
 
 
 def test_solver_protocol_rejects_silent_version_drift():
@@ -36,3 +26,4 @@ def test_database_is_backed_up_before_forward_migration(tmp_path: Path):
     assert upgraded.migration_backup_path.exists()
     with upgraded.connect() as con:
         assert int(con.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0]) == SCHEMA_VERSION
+

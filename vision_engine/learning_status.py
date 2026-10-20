@@ -6,6 +6,7 @@ from typing import Any
 from .constants import JEWELS
 from .experience import PolicyModelInfo
 from .persistence import BingoDB
+from .retrospective_learning import audit_summary
 
 
 def _local_complete_vectors(db: BingoDB) -> list[tuple[int, ...]]:
@@ -61,7 +62,11 @@ def build_learning_snapshot(
             "delta": observed - expected,
         })
 
+    hindsight = audit_summary(db)
+    influence = db.ml_decision_summary()
     return {
+        "retrospective": hindsight,
+        "live_influence": influence,
         "completed_games": len(completed),
         "verified_games": len(verified),
         "cf_samples": int(info.counterfactual_samples),

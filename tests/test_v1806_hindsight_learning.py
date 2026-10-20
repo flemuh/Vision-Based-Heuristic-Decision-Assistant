@@ -88,9 +88,15 @@ def test_hindsight_reward_model_learns_unchosen_winning_alternatives(tmp_path):
 
     # The historical first move BL->L5C2 (index 21) killed 3-Lucky for that
     # actual draw. BL alternatives 6/10/24 preserved a 3-Lucky allocation.
+    # Hindsight oracle is offline research only. A losing historical path
+    # must NEVER inject an unobserved winning move into the live solver.
+    from vision_engine.retrospective_learning import cached_audit
+    from vision_engine.winning_memory import validated_episodes
+    audit = cached_audit(policy.db, validated_episodes(policy.db)[0])
+    assert audit["best_total"] > 1000
+    assert {6, 10, 24}.issubset(set(audit["first_better_choice"]["better_alternative_positions"]))
     legal = board.legal_positions("BL", 0)
-    scores = policy.predict(board, 0, "BL", legal)
-    assert max(scores[p] for p in (6, 10, 24)) > scores[21]
+    assert policy.predict(board, 0, "BL", legal) == {}
 
 
 def test_retraining_is_a_full_rebuild_not_duplicate_reward(tmp_path):

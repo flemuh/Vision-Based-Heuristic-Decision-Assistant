@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterable
 
 from .constants import CENTER, JEWELS, JEWEL_INDEX
+
+
+@lru_cache(maxsize=256)
+def _board_lookup(cells: tuple[str | None, ...]) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...]]:
+    """Compile immutable four-copies-per-jewel board into positions and bitmasks.
+
+    Works across new Board objects for the same screen layout. The cache is
+    bounded and shared only within a process; no mutable board state is stored.
+    """
+    positions = tuple(tuple(i for i, cell in enumerate(cells) if cell == j) for j in JEWELS)
+    masks = tuple(sum(1 << i for i in found) for found in positions)
+    return positions, masks
 
 
 @dataclass(frozen=True)
@@ -33,14 +46,10 @@ class Board:
         return cls(cells)
 
     def positions(self, jewel: str) -> tuple[int, ...]:
-        return tuple(i for i, j in enumerate(self.cells) if j == jewel)
+        return _board_lookup(self.cells)[0][JEWEL_INDEX[jewel]]
 
     def jewel_counts_in_mask(self, mask: int) -> tuple[int, ...]:
-        out = [0] * len(JEWELS)
-        for i, jewel in enumerate(self.cells):
-            if jewel is not None and ((mask >> i) & 1):
-                out[JEWEL_INDEX[jewel]] += 1
-        return tuple(out)
+        return tuple((mask & m).bit_count() for m in _board_lookup(self.cells)[1])
 
     def legal_positions(self, jewel: str, mask: int) -> tuple[int, ...]:
         return tuple(i for i in self.positions(jewel) if not ((mask >> i) & 1))

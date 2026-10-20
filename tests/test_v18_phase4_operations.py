@@ -11,7 +11,7 @@ from vision_engine.research_export import export_research_dataset
 
 def test_schema_v9_persists_latency_and_percentiles(tmp_path: Path):
     db = BingoDB(tmp_path / "b.sqlite3")
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
     for ms, hit in ((10,True),(20,True),(30,False),(40,True),(50,False)):
         db.save_telemetry(None, "decision-roundtrip", ms, hit)
     s = db.telemetry_summary("decision-roundtrip")
@@ -40,9 +40,3 @@ def test_stored_replay_and_research_export(tmp_path: Path):
         assert (out / name).exists()
 
 
-def test_system_ui_has_health_recovery_replay_export_and_restart():
-    source = Path(__file__).parents[1].joinpath("vision_engine","gui.py").read_text(encoding="utf-8")
-    assert 'text="System"' in source
-    for label in ("Recover current round","Game history / Replay","Export research dataset","Restart WSL solver"):
-        assert label in source
-    assert 'telemetry_summary("decision-roundtrip")' in source

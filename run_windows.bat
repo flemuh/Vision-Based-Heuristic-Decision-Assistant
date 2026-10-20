@@ -1,7 +1,10 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title Speedlora Jewel Bingo Assistant V18.0.26 State Integrity Root Fix
+rem Native Windows process: no WSL required; override in a custom launcher if needed.
+set "SPEEDLORA_SOLVER_BACKEND=native"
+if not defined SPEEDLORA_COMPILED_PLAN set "SPEEDLORA_COMPILED_PLAN=1"
+title Vision-Based Heuristic Decision Assistant
 
 if not exist "data" mkdir "data"
 set "PIP_LOG=%CD%\data\pip-install.log"
@@ -12,7 +15,7 @@ set "PY_TAG="
 >> "%PIP_LOG%" echo ==========================================
 
 echo ============================================================
-echo  Speedlora Jewel Bingo Assistant - Windows launcher
+echo  Vision-Based Heuristic Decision Assistant - Windows launcher
 echo ============================================================
 echo.
 
@@ -131,31 +134,24 @@ if errorlevel 1 (
 
 echo       Core dependencies and project imports: OK
 
-echo.
-echo Checking Ubuntu/WSL persistent solver backend ...
-if not defined JEWEL_BINGO_WSL_DISTRO set "JEWEL_BINGO_WSL_DISTRO=Ubuntu"
-set "WSL_DISTRO=%JEWEL_BINGO_WSL_DISTRO%"
-where wsl.exe >nul 2>&1
-if errorlevel 1 (
-    echo       WSL not found. The app will use the local Windows compatibility solver.
-) else (
-    wsl.exe -d "%WSL_DISTRO%" -- python3 --version >nul 2>&1
+rem Optional Numba acceleration runs inside the SAME venv as the native solver.
+if "%SPEEDLORA_COMPILED_PLAN%"=="1" (
+    "%VENV_PY%" -c "import numba" >nul 2>&1
     if errorlevel 1 (
-        echo       WSL distro "%WSL_DISTRO%" does not have python3. Local fallback will be used.
-    ) else (
-        wsl.exe -d "%WSL_DISTRO%" --cd "%CD%" -- python3 -c "import vision_engine; from vision_engine.solver.service import SolverEngine" >nul 2>&1
-        if errorlevel 1 (
-            echo       Ubuntu/Python works, but this project could not be imported from its own folder.
-            echo       Local Windows fallback will be used.
-        ) else (
-            echo       WSL distro "%WSL_DISTRO%" + python3 + project import detected.
-            echo       V18.0.26 will use this exact folder via WSL --cd; no wslpath is used.
-        )
+        echo Installing optional Numba speed kernel in native solver venv ...
+        %PY_CMD% -m pip --python "%VENV_PY%" install "numba>=0.60" --log "%PIP_LOG%"
+        if errorlevel 1 goto :REQUIREMENTS_FAILED
     )
+    "%VENV_PY%" -c "import numba; import vision_engine.solver.r39_plan_kernel" >nul 2>&1
+    if errorlevel 1 goto :IMPORT_FAILED
+    echo Optional compiled route kernel enabled.
 )
 
 echo.
-echo Starting Jewel Bingo Assistant V18.0.26 State Integrity Root Fix ...
+echo Native persistent solver selected: Windows Python, no WSL.
+
+echo.
+echo Starting Vision-Based Heuristic Decision Assistant ...
 echo.
 "%VENV_PY%" app.py
 set "APP_EXIT=%ERRORLEVEL%"

@@ -1,0 +1,46 @@
+{
+  "machine": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "cpu_count": 5,
+  "python": "3.13.5",
+  "jit_warmup_s": 1.7165127979999966,
+  "board_seed": "reference-board-r39",
+  "current_jewel": "BL",
+  "repeats": 2,
+  "baseline": "compiled route features without Expectimax policy-key cache",
+  "optimized": "compiled route features with context-aware policy-key cache and reduced repeated work",
+  "all_decisions_identical": true,
+  "results": [
+    {
+      "rollouts": 16,
+      "baseline_median_s": 0.19796184850000031,
+      "optimized_median_s": 0.20660107350001056,
+      "absolute_gain_s": -0.008639225000010242,
+      "speedup": 0.9581840265703663,
+      "reduction_pct": -4.364085840514986
+    },
+    {
+      "rollouts": 60,
+      "baseline_median_s": 0.5333864155000043,
+      "optimized_median_s": 0.4406379954999977,
+      "absolute_gain_s": 0.0927484200000066,
+      "speedup": 1.2104866601318929,
+      "reduction_pct": 17.38859807913609
+    },
+    {
+      "rollouts": 120,
+      "baseline_median_s": 0.9101916259999854,
+      "optimized_median_s": 0.7226958975000031,
+      "absolute_gain_s": 0.1874957284999823,
+      "speedup": 1.2594393148606209,
+      "reduction_pct": 20.599588388213245
+    },
+    {
+      "rollouts": 10000,
+      "baseline_median_s": 4.562913996500001,
+      "optimized_median_s": 2.9877365509999976,
+      "absolute_gain_s": 1.5751774455000032,
+      "speedup": 1.527214303742005,
+      "reduction_pct": 34.52130473439229
+    }
+  ]
+}

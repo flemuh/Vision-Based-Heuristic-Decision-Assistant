@@ -34,7 +34,7 @@ def test_rng_influence_stays_disabled_when_blend_is_zero_even_after_100_games(tm
 
 def test_learning_ui_explains_math_control_and_research_only_rng():
     source = Path(__file__).parents[1].joinpath("vision_engine", "gui.py").read_text(encoding="utf-8")
-    assert 'text="Learning"' in source
-    assert "The math solver stays in control" in source
-    assert "DISABLED (research only)" in source
-    assert "validation {snap['cf_validation_games']}/{snap['required_validation_games']}" in source
+    assert 'text="Aprendizado (ML)"' in source
+    assert "O solver matemático continua responsável" in source
+    assert "DESLIGADA (apenas pesquisa)" in source
+    assert "validação {snap['cf_validation_games']}/{snap['required_validation_games']}" in source

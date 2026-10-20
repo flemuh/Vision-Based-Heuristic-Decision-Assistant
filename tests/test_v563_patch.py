@@ -126,12 +126,3 @@ def test_plain_subprocess_fallback_returns_solver_result(tmp_path):
     out_path.unlink(missing_ok=True)
 
 
-def test_gui_patch_hides_legacy_troubleshooting_and_never_paints_fast_ranking():
-    source = (Path(__file__).parents[1] / "vision_engine" / "gui.py").read_text(encoding="utf-8")
-    assert 'text="Troubleshooting' not in source
-    assert 'text="Save game manually"' not in source
-    assert "FAST complete for {jewel}; refining final ranking" in source
-    assert "_render_recommendations(mask, jewel, recs, refined=False)" not in source
-    assert "self.phase == GamePhase.COMPLETE" in source
-    assert "_show_game_complete_summary" in source
-

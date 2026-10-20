@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from vision_engine.board import Board
 from vision_engine.data_home import prepare_user_data
@@ -96,7 +95,7 @@ def test_schema_v7_checkpoints_and_idempotent_database_merge(tmp_path):
                       {"lucky": 0, "normal": 0, "jewel": 630, "total": 630}, None, None)
 
     new = BingoDB(tmp_path / "new.sqlite3")
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
     assert new.merge_database(old_path)
     assert not new.merge_database(old_path)  # migration_sources makes it idempotent
     rows = [r for r in new.game_rows() if r["id"] == "old-g1"]

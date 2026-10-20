@@ -18,7 +18,7 @@ from .win32 import win32_snapshot
 class WaitingDiagnostics:
     """In-memory runtime timeline plus a localhost-only diagnostic probe.
 
-    Nothing is written to disk by the Auto Play hot path. A separate diagnostic
+    Nothing is written to disk by the live monitor hot path. A separate diagnostic
     process can request snapshots while the app is stuck and write them later.
     """
 

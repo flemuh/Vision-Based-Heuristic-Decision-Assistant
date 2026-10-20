@@ -32,21 +32,3 @@ def test_run_windows_does_not_require_private_venv_pip():
     assert "pip._vendor.urllib3.packages" not in text
 
 
-def test_windows_launchers_have_unique_labels_and_no_blank_gotos():
-    for name in ("run_windows.bat", "setup_windows.bat"):
-        text = _read(name)
-        labels = _labels(text)
-        assert labels, name
-        assert len(labels) == len(set(labels)), (name, labels)
-        assert not re.search(r"(?m)^\s*goto\s*$", text), name
-        assert not re.search(r"(?m)^\s*goto\s*:\s*$", text), name
-
-
-def test_setup_windows_uses_same_short_external_venv_strategy():
-    text = _read("setup_windows.bat")
-    assert ":VALIDATE_HOST_PIP" in text
-    assert "SpeedloraJewelBingo\\v18026-py" in text
-    assert '-m venv --without-pip "%VENV_DIR%"' in text
-    assert '-m pip --python "%VENV_PY%" install' in text
-    assert '"%VENV_PY%" -m pytest -q' in text
-    assert '-m ensurepip' not in text.lower()

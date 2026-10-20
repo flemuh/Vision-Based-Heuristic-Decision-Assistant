@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 from .constants import JEWEL_SCORE, LUCKY_LINES, LUCKY_SCORE, NORMAL_LINES, NORMAL_SCORE
 
@@ -26,7 +27,15 @@ LUCKY_MASKS = {name: line_mask(cells) for name, cells in LUCKY_LINES.items()}
 NORMAL_MASKS = {name: line_mask(cells) for name, cells in NORMAL_LINES.items()}
 
 
+@lru_cache(maxsize=262144)
 def score_mask(mask: int) -> ScoreBreakdown:
+    """Board-independent exact score with bounded process-local transposition cache.
+
+    A selected-cell bitmask always scores identically regardless of jewel layout.
+    Cache hits are therefore mathematically exact and can be shared by all
+    Advisor instances within one persistent worker. The cache never touches
+    current jewel detection, strategy, ML, or game state.
+    """
     lucky_names = tuple(name for name, lm in LUCKY_MASKS.items() if (mask & lm) == lm)
     normal_names = tuple(name for name, lm in NORMAL_MASKS.items() if (mask & lm) == lm)
 

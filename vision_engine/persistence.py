@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,11 +50,18 @@ class BingoDB:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         dest = backup_dir / f"{self.path.stem}_schema{old}_to_{SCHEMA_VERSION}_{stamp}.sqlite3"
         try:
-            shutil.copy2(self.path, dest)
-            # WAL/SHM are deliberately not copied: migration backup is taken before
-            # this process opens the DB and historical releases normally close cleanly.
+            # sqlite3.backup() copies a CONSISTENT snapshot including committed
+            # WAL frames, unlike a raw copy of the .sqlite3 file. This matters
+            # particularly for users who have thousands of past decisions.
+            with sqlite3.connect(self.path, timeout=15) as source:
+                with sqlite3.connect(dest, timeout=15) as backup:
+                    source.backup(backup)
             return dest
-        except OSError:
+        except (OSError, sqlite3.Error):
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
             return None
 
     def connect(self) -> sqlite3.Connection:
@@ -191,6 +197,27 @@ class BingoDB:
                     source_mtime REAL NOT NULL,
                     merged_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS retrospective_audits (
+                    game_id TEXT PRIMARY KEY,
+                    audit_version INTEGER NOT NULL,
+                    computed_at TEXT NOT NULL,
+                    audit_json TEXT NOT NULL,
+                    FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS ml_decision_events (
+                    game_id TEXT NOT NULL,
+                    step INTEGER NOT NULL,
+                    current_jewel TEXT NOT NULL,
+                    matched INTEGER NOT NULL,
+                    changed INTEGER NOT NULL,
+                    baseline_pos INTEGER,
+                    ml_pos INTEGER,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(game_id,step),
+                    FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_ml_events_changed ON ml_decision_events(changed);
 
                 CREATE TABLE IF NOT EXISTS telemetry (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -354,6 +381,28 @@ class BingoDB:
                     ),
                 )
 
+    def record_ml_decision(self, game_id: str, step: int, jewel: str,
+                           matched: bool, changed: bool, baseline_pos: int | None,
+                           ml_pos: int | None) -> None:
+        """One observation per move; FAST -> REFINE updates rather than double-counts."""
+        with self.connect() as con:
+            con.execute(
+                """INSERT INTO ml_decision_events
+                   (game_id,step,current_jewel,matched,changed,baseline_pos,ml_pos,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(game_id,step) DO UPDATE SET
+                   current_jewel=excluded.current_jewel,matched=excluded.matched,
+                   changed=excluded.changed,baseline_pos=excluded.baseline_pos,
+                   ml_pos=excluded.ml_pos,updated_at=excluded.updated_at""",
+                (game_id, int(step), jewel, int(bool(matched)), int(bool(changed)),
+                 baseline_pos, ml_pos, datetime.now(timezone.utc).isoformat()),
+            )
+
+    def ml_decision_summary(self) -> dict[str, int]:
+        with self.connect() as con:
+            row = con.execute("SELECT COUNT(*) AS decisions, COALESCE(SUM(matched),0) AS matches, "
+                              "COALESCE(SUM(changed),0) AS changes FROM ml_decision_events").fetchone()
+        return {"decisions": row["decisions"], "matches": row["matches"], "changes": row["changes"]}
+
     def finalize_game(
         self,
         game_id: str,
@@ -403,6 +452,9 @@ class BingoDB:
     def verify_score(self, game_id: str, score: dict) -> None:
         with self.connect() as con:
             con.execute("UPDATE games SET verified_score_json=? WHERE id=?", (self._json(score), game_id))
+            # Any previous hindsight derived from an unverified/mismatched score
+            # becomes stale until the full 14-step replay is revalidated.
+            con.execute("DELETE FROM retrospective_audits WHERE game_id=?", (game_id,))
 
     def save_checkpoint(
         self, game_id: str, state_version: int, confirmed_mask: int, provisional_mask: int | None,

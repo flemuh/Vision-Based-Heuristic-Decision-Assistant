@@ -9,6 +9,7 @@ from typing import Callable
 from vision_engine.solver.client import SolverClient
 from vision_engine.solver.protocol import SolverRequest, SolverResponse
 from vision_engine.solver.wsl import ensure_wsl_solver
+from vision_engine.solver.native import ensure_native_solver
 
 from .solver_admission import AdmissionTicket, BridgeAdmissionGate
 from .latest_decision import LatestDecisionLane
@@ -26,8 +27,10 @@ class LiveSolverBridge:
         auto_start_wsl: bool = True,
         session_id: str = "",
         session_timeout: float = 5.0,
+        backend: str = "wsl",
     ):
         self.root_dir = Path(root_dir)
+        self.backend = str(backend)
         self.host = host
         self.port = int(port)
         self.workers = int(workers)
@@ -41,6 +44,7 @@ class LiveSolverBridge:
         self.available = False
         self.status = "not-started"
         self.wsl_process = None
+        self.native_process = None
         self._lock = threading.RLock()
         self._starting = False
         self._exclusive_token: str | None = None
@@ -73,7 +77,10 @@ class LiveSolverBridge:
     def _start_sync(self) -> tuple[bool, str]:
         ok = False
         status = "unavailable"
-        if self.auto_start_wsl:
+        if self.backend == "native":
+            ok, proc, status = ensure_native_solver(self.root_dir, self.host, self.port, self.workers)
+            self.native_process = proc
+        elif self.auto_start_wsl:
             ok, proc, status = ensure_wsl_solver(
                 self.root_dir, self.host, self.port, self.workers, distro=self.wsl_distro,
             )
@@ -95,9 +102,16 @@ class LiveSolverBridge:
                     self.client.shutdown_service()
                 except Exception:
                     self.client.close()
-                ok, proc, restart_status = ensure_wsl_solver(
-                    self.root_dir, self.host, self.port, self.workers, distro=self.wsl_distro,
-                )
+                if self.backend == "native":
+                    ok, proc, restart_status = ensure_native_solver(
+                        self.root_dir, self.host, self.port, self.workers,
+                    )
+                    self.native_process = proc
+                else:
+                    ok, proc, restart_status = ensure_wsl_solver(
+                        self.root_dir, self.host, self.port, self.workers, distro=self.wsl_distro,
+                    )
+                    self.wsl_process = proc
                 if not ok:
                     return False, f"session-recovery-failed:{type(first_exc).__name__}:{first_exc}"
                 self.wsl_process = proc
@@ -287,7 +301,7 @@ class LiveSolverBridge:
                 except Exception:
                     pass
             self._exclusive_token = None
-            if self.wsl_process is not None:
+            if self.wsl_process is not None or self.native_process is not None:
                 try:
                     control.shutdown_service()
                 except Exception:

@@ -1,0 +1,4 @@
+-r requirements.txt
+numba>=0.60
+matplotlib>=3.8
+pytest>=8

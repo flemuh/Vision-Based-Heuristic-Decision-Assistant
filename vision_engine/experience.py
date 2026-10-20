@@ -18,6 +18,8 @@ from .persistence import BingoDB
 from .replay import _terminal_masks_for_counts
 from .scoring import score_mask
 from .versioning import MODEL_VERSION
+from .winning_memory import WinningMemory, validated_episodes
+from .retrospective_learning import cached_audit, audit_stored_games
 
 
 @dataclass
@@ -44,6 +46,8 @@ class PolicyModelInfo:
     hindsight_mae_score: float | None = None
     hindsight_trusted: bool = False
     bootstrap_loaded: bool = False
+    counterfactual_recovery_games: int = 0
+    retrospectively_audited_games: int = 0
 
 
 def _line_progress(mask: int, cells: Iterable[int]) -> float:
@@ -100,10 +104,10 @@ class ExperiencePolicy:
     Counterfactual model: multi-output imitation of the mathematical solver for
     every candidate action. It predicts the seven Utility components directly.
 
-    Outcome model: learns only the residual between a chosen action's solver
-    target and the verified/computed real outcome. It is deliberately gated by
-    game-level validation and receives a small weight, so a few lucky games
-    cannot override the mathematical policy.
+    Replay-validated completed >=999 scores train factual ML. Replay-valid
+    lower scores with a provable >1000 alternative train offline hindsight. Live actions NEVER use the generalized model; only exact
+    board + observed jewel/position prefix matches from WinningMemory may
+    break mathematically indistinguishable solver decisions.
     """
 
     UTILITY_COLUMNS = ("p3", "p2l1n", "p1l2n", "p1l1n", "p_gt1000", "p_ge999", "expected_score")
@@ -118,9 +122,11 @@ class ExperiencePolicy:
         self.bootstrap_model = None
         self.bootstrap_model_path = self.model_path.parent / "bootstrap_solver_model.joblib"
         self.info = PolicyModelInfo()
+        self.winning_memory = WinningMemory()
         self.reload()
 
     def reload(self) -> None:
+        self.winning_memory = WinningMemory.from_db(self.db)
         self.bootstrap_model = None
         if self.bootstrap_model_path.exists():
             try:
@@ -136,6 +142,14 @@ class ExperiencePolicy:
             return
         try:
             payload = joblib.load(self.model_path)
+            if payload.get("training_policy") != "validated-ge999-and-counterfactual-v2":
+                # An old model was trained on losses/partial games: quarantine it.
+                # Do not delete the user's model file or SQLite history.
+                self.counterfactual_model = None
+                self.outcome_residual_model = None
+                self.hindsight_model = None
+                self.info = PolicyModelInfo(bootstrap_loaded=self.bootstrap_model is not None)
+                return
             self.counterfactual_model = payload.get("counterfactual_model")
             self.outcome_residual_model = payload.get("outcome_residual_model")
             self.hindsight_model = payload.get("hindsight_model")
@@ -167,7 +181,30 @@ class ExperiencePolicy:
         holdout_fraction: float = 0.25,
         min_validation_games: int = 8,
     ) -> PolicyModelInfo:
-        cf_rows = self.db.counterfactual_rows()
+        # Factual >=999 episodes can enter the exact live history. Completed
+        # replay-valid losses with a >1000 feasible alternative enter offline
+        # retrospective training only; they NEVER masquerade as real wins.
+        self.winning_memory = WinningMemory.from_db(self.db)
+        winning_ids = self.winning_memory.winning_game_ids
+        winning_examples = {x.game_id: x for x in self.winning_memory.examples}
+        # Validate every saved candidate's state against the actual winning
+        # episode; final totals alone do not make unrelated snapshots eligible.
+        cf_rows = []
+        for row in self.db.counterfactual_rows():
+            example = winning_examples.get(str(row.get("game_id")))
+            if example is None:
+                continue
+            try:
+                step = int(row["step"])
+                expected_mask = sum(1 << p for p in example.actions[:step])
+                if (not 0 <= step < 14
+                    or int(row["mask_before"]) != expected_mask
+                    or str(row["jewel"]) != example.sequence[step]
+                    or tuple(json.loads(row["board_json"])) != example.board):
+                    continue
+            except (KeyError, TypeError, ValueError, IndexError, json.JSONDecodeError):
+                continue
+            cf_rows.append(row)
         x_train: list[np.ndarray] = []
         y_train: list[list[float]] = []
         x_val: list[np.ndarray] = []
@@ -219,155 +256,64 @@ class ExperiencePolicy:
                 all_y = y_train + y_val
                 cf_model.fit(np.stack(all_x), np.asarray(all_y, dtype=np.float64))
 
-        # Real-outcome residuals on chosen actions. This tackles credit assignment
-        # better than giving every move the same raw final-score target: each move
-        # learns how reality differed from the solver's own prediction at that state.
+        # Legacy real-outcome residuals were not causally assigned to actions.
+        # Retain raw SQLite for future research, but omit this model, its MAE
+        # and its expensive feature extraction entirely in this release.
         x_out_train: list[np.ndarray] = []
-        y_out_train: list[float] = []
         x_out_val: list[np.ndarray] = []
-        y_out_val: list[float] = []
-        out_games = set(); out_val_games = set()
-        with self.db.connect() as con:
-            rows = con.execute(
-                """SELECT a.game_id,a.mask_before,a.jewel,a.action_pos,g.board_json,
-                          COALESCE(g.verified_score_json,g.computed_score_json) AS score_json,
-                          d.solver_target
-                   FROM actions a JOIN games g ON g.id=a.game_id
-                   LEFT JOIN decision_samples d ON d.game_id=a.game_id AND d.step=a.step AND d.candidate_pos=a.action_pos
-                   WHERE g.board_json IS NOT NULL
-                     AND COALESCE(g.verified_score_json,g.computed_score_json) IS NOT NULL"""
-            ).fetchall()
-        for row in rows:
-            board = self._board_from_json(row["board_json"])
-            if board is None or row["solver_target"] is None:
-                continue
-            try:
-                score = json.loads(row["score_json"])
-                pos = int(row["action_pos"]); jewel = str(row["jewel"]); mask = int(row["mask_before"])
-                if board.cells[pos] != jewel:
-                    continue
-                actual_target = utility_learning_target(_outcome_utility(score))
-                residual = float(actual_target - float(row["solver_target"]))
-                x = action_features(board, mask, jewel, pos)
-                gid = str(row["game_id"]); out_games.add(gid)
-                if _stable_holdout(gid, holdout_fraction):
-                    x_out_val.append(x); y_out_val.append(residual); out_val_games.add(gid)
-                else:
-                    x_out_train.append(x); y_out_train.append(residual)
-            except Exception:
-                continue
-
+        out_games: set[str] = set()
+        out_val_games: set[str] = set()
         outcome_model = None
-        residual_mae = None
-        baseline_mae = None
-        outcome_improvement = None
+        residual_mae = baseline_mae = outcome_improvement = None
         outcome_trusted = False
-        if len(out_games) >= min_outcome_games and len(x_out_train) >= min_outcome_samples:
-            outcome_model = NumpyRidgeRegressor(alpha=8.0)
-            outcome_model.fit(np.stack(x_out_train), np.asarray(y_out_train, dtype=np.float64))
-            if x_out_val:
-                pred = outcome_model.predict(np.stack(x_out_val))
-                residual_mae = float(mean_absolute_error(y_out_val, pred))
-                baseline_mae = float(mean_absolute_error(y_out_val, np.zeros(len(y_out_val))))
-                if baseline_mae > 0:
-                    outcome_improvement = 1.0 - (residual_mae / baseline_mae)
-                outcome_trusted = (
-                    len(out_val_games) >= int(min_validation_games)
-                    and baseline_mae > 0
-                    and residual_mae < baseline_mae * 0.92
-                )
-            if x_out_val:
-                outcome_model.fit(
-                    np.stack(x_out_train + x_out_val),
-                    np.asarray(y_out_train + y_out_val, dtype=np.float64),
-                )
 
-        # Retrospective candidate reward. Unlike the legacy outcome model, this
-        # labels *every saved candidate*, including actions that were not chosen.
-        # For a completed game we know the 14 jewels that actually arrived. For
-        # each historical state/candidate we ask whether at least one legal final
-        # allocation with that same draw composition still reaches each target.
-        # The future sequence is used ONLY to create offline labels; it is never
-        # part of action_features(), so live inference cannot peek at future jewels.
+        # Validated end-of-game hindsight. The complete future draw is allowed
+        # ONLY in these cached offline targets. This includes alternate wins
+        # >1000 from real losses; these are research labels, NOT live memory.
+        # Observable games need no saved solver candidate rows to contribute.
         h_x_train: list[np.ndarray] = []
         h_y_train: list[list[float]] = []
         h_x_val: list[np.ndarray] = []
         h_y_val: list[list[float]] = []
         h_games: set[str] = set()
         h_val_games: set[str] = set()
-        game_map = {str(g.get("id")): g for g in self.db.game_rows()}
-        rows_by_game: dict[str, list[dict]] = defaultdict(list)
-        for row in cf_rows:
-            rows_by_game[str(row.get("game_id"))].append(row)
-
-        for gid, game_rows in rows_by_game.items():
-            game = game_map.get(gid)
-            if not game or not game.get("finished_at") or not game.get("board_json") or not game.get("sequence_json"):
+        retrospective_recoverable = 0
+        audited_games = 0
+        for episode in validated_episodes(self.db):
+            audit = cached_audit(self.db, episode)
+            if not audit or not audit.get("valid"):
                 continue
-            board = self._board_from_json(game.get("board_json"))
-            if board is None:
+            audited_games += 1
+            can_recover = episode.total < 999 and bool(audit["could_exceed_1000"])
+            if can_recover:
+                retrospective_recoverable += 1
+            if episode.total < 999 and not can_recover:
                 continue
-            try:
-                sequence = json.loads(game.get("sequence_json") or "[]")
-            except Exception:
-                continue
-            sequence = [str(j) for j in sequence if str(j) in JEWELS]
-            if len(sequence) != 14:
-                continue
-            counts_counter = Counter(sequence)
-            counts = tuple(int(counts_counter.get(j, 0)) for j in JEWELS)
-            if any(c > 4 for c in counts):
-                continue
-            terminal_masks = _terminal_masks_for_counts(board.cells, counts)
-            if not terminal_masks:
-                continue
-            terminal = [(m, score_mask(m)) for m in terminal_masks]
-            step_rows: dict[int, list[dict]] = defaultdict(list)
-            for row in game_rows:
-                try:
-                    step_rows[int(row["step"])].append(row)
-                except Exception:
-                    pass
-
-            game_examples = 0
-            is_val_game = _stable_holdout(gid, holdout_fraction)
-            for _step, candidates in sorted(step_rows.items()):
-                if not candidates:
-                    continue
-                try:
-                    prefix = int(candidates[0]["mask_before"])
-                except Exception:
-                    continue
-                feasible_from_prefix = [(m, sc) for m, sc in terminal if (m & prefix) == prefix]
-                if not feasible_from_prefix:
-                    continue
-                for row in candidates:
-                    try:
-                        jewel = str(row["jewel"]); pos = int(row["candidate_pos"]); mask = int(row["mask_before"])
-                    except Exception:
-                        continue
-                    if jewel not in JEWELS or mask != prefix or board.cells[pos] != jewel or ((prefix >> pos) & 1):
-                        continue
-                    matching = [sc for m, sc in feasible_from_prefix if (m >> pos) & 1]
-                    if not matching:
-                        continue
+            board = Board(episode.board)
+            is_val_game = _stable_holdout(episode.game_id, holdout_fraction)
+            count = 0
+            for step in audit["steps"]:
+                mask = int(step["mask_before"])
+                jewel = step["jewel"]
+                for candidate in step["candidates"]:
+                    pos = int(candidate["position"])
                     labels = [
-                        float(any(sc.lucky >= 3 for sc in matching)),
-                        float(any(sc.lucky >= 2 and sc.normal >= 1 for sc in matching)),
-                        float(any(sc.lucky >= 1 and sc.normal >= 2 for sc in matching)),
-                        float(any(sc.lucky >= 1 and sc.normal >= 1 for sc in matching)),
-                        float(any(sc.total > 1000 for sc in matching)),
-                        float(any(sc.total >= 999 for sc in matching)),
-                        float(max(sc.total for sc in matching)),
+                        float(candidate["possible_3lucky"]),
+                        float(candidate["possible_2l1n"]),
+                        float(candidate["possible_1l2n"]),
+                        float(candidate["possible_1l1n"]),
+                        float(candidate["possible_gt1000"]),
+                        float(candidate["possible_ge999"]),
+                        float(candidate["best_score"]),
                     ]
-                    x = action_features(board, mask, jewel, pos)
+                    features = action_features(board, mask, jewel, pos)
                     if is_val_game:
-                        h_x_val.append(x); h_y_val.append(labels); h_val_games.add(gid)
+                        h_x_val.append(features); h_y_val.append(labels); h_val_games.add(episode.game_id)
                     else:
-                        h_x_train.append(x); h_y_train.append(labels)
-                    game_examples += 1
-            if game_examples:
-                h_games.add(gid)
+                        h_x_train.append(features); h_y_train.append(labels)
+                    count += 1
+            if count:
+                h_games.add(episode.game_id)
 
         hindsight_model = None
         h_mae_p3 = h_mae_gt = h_mae_score = None
@@ -421,6 +367,8 @@ class ExperiencePolicy:
             hindsight_mae_score=h_mae_score,
             hindsight_trusted=h_trusted,
             bootstrap_loaded=self.bootstrap_model is not None,
+            counterfactual_recovery_games=retrospective_recoverable,
+            retrospectively_audited_games=audited_games,
         )
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -430,77 +378,20 @@ class ExperiencePolicy:
             "info": asdict(self.info),
             "utility_columns": self.UTILITY_COLUMNS,
             "model_version": MODEL_VERSION,
+            "training_policy": "validated-ge999-and-counterfactual-v2",
         }
         tmp_path = self.model_path.with_suffix(self.model_path.suffix + ".tmp")
         joblib.dump(payload, tmp_path)
         tmp_path.replace(self.model_path)
         return self.info
 
-    def predict(self, board: Board, mask: int, jewel: str, positions: Iterable[int]) -> dict[int, float]:
-        positions = list(positions)
-        if not positions:
-            return {}
-        x = np.stack([action_features(board, mask, jewel, p) for p in positions])
-
-        # Base learned score imitates the mathematical solver. If no base model
-        # exists yet, hindsight can still contribute a conservative tie-break.
-        model = self.counterfactual_model or self.bootstrap_model
-        if model is None:
-            scores = np.zeros(len(positions), dtype=np.float64)
-        else:
-            raw = np.asarray(model.predict(x), dtype=np.float64)
-            # If both models exist but local solver imitation is still unvalidated,
-            # softly blend the generic bootstrap. Once local validation passes, the
-            # board/user-specific model becomes authoritative for ML tie-breaking.
-            if self.counterfactual_model is not None and self.bootstrap_model is not None and not self.info.counterfactual_trusted:
-                boot = np.asarray(self.bootstrap_model.predict(x), dtype=np.float64)
-                if boot.shape == raw.shape:
-                    raw = 0.70 * raw + 0.30 * boot
-            if raw.ndim == 1:
-                raw = raw.reshape(-1, 1)
-            base_scores = []
-            for row in raw:
-                if len(row) >= 7:
-                    u = Utility(*[float(v) for v in row[:7]])
-                    base_scores.append(utility_learning_target(u))
-                else:
-                    base_scores.append(float(row[0]))
-            scores = np.asarray(base_scores, dtype=np.float64)
-
-        # Real-outcome learning is a small residual correction and only activates
-        # if it beat a zero-residual baseline on held-out games.
-        if self.outcome_residual_model is not None and self.info.outcome_trusted:
-            residual = np.asarray(self.outcome_residual_model.predict(x), dtype=np.float64)
-            cap = np.quantile(np.abs(residual), 0.90) if residual.size > 1 else abs(residual[0])
-            cap = max(100.0, min(float(cap), 1800.0))
-            scores = scores + 0.15 * np.clip(residual, -cap, cap)
-
-        # V18.0.6 closes the hindsight-learning loop. A candidate that preserved
-        # a winning allocation in real historical draws receives positive reward;
-        # one that destroyed it receives negative relative credit. The model sees
-        # only live-state features at inference time. Because Advisor consults
-        # learned scores only for true mathematical/statistical ties, this cannot
-        # override a clearly superior solver action.
-        if self.hindsight_model is not None:
-            hp = np.asarray(self.hindsight_model.predict(x), dtype=np.float64)
-            if hp.ndim == 1:
-                hp = hp.reshape(-1, 1)
-            if hp.shape[1] >= 7:
-                hindsight_scores = []
-                for row in hp:
-                    probs = [float(np.clip(v, 0.0, 1.0)) for v in row[:6]]
-                    best_score = float(np.clip(row[6], 0.0, 2000.0))
-                    hindsight_scores.append(utility_learning_target(Utility(*probs, best_score)))
-                hs = np.asarray(hindsight_scores, dtype=np.float64)
-                # Centering makes this pure relative credit among the legal moves.
-                # Early/unvalidated history gets a small influence; validated
-                # history can contribute more, still only inside solver ties.
-                hs = hs - float(np.mean(hs))
-                if self.info.hindsight_trusted:
-                    weight = 0.22
-                else:
-                    weight = min(0.10, 0.025 + 0.005 * max(0, self.info.hindsight_games))
-                scores = scores + weight * hs
-
-        return {p: float(v) for p, v in zip(positions, scores)}
+    def predict(
+        self, board: Board, mask: int, jewel: str, positions: Iterable[int],
+        *, observed_jewels: Iterable[str] | None = None,
+        observed_positions: Iterable[int] | None = None,
+    ) -> dict[int, float]:
+        """Exact >=999 observed-history tie-break only. Offline alternatives excluded."""
+        return self.winning_memory.matching_scores(
+            board, mask, jewel, positions, observed_jewels, observed_positions,
+        )
 
